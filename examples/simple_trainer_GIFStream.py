@@ -40,7 +40,7 @@ from gsplat.rendering import rasterization, view_to_visible_anchors
 from gsplat.strategy import GIFStreamStrategy
 
 from gsplat.compression_simulation.simulation import GIFStreamCompressionSimulation
-
+from gsplat.exporter import export_splats, rgb2sh, save_ply
 class ProfilerConfig:
     def __init__(self):
         self.enabled = False
@@ -79,6 +79,8 @@ class Config:
     disable_viewer: bool = False
     # Path to the .pt files. If provide, it will skip training and run evaluation only.
     ckpt: Optional[List[str]] = None
+    # Export the scene as a sequence of .ply files
+    export_ply: bool = False
     # Name of compression strategy to use
     compression: Optional[Literal["end2end", "2dcodec"]] = None
     # Quantization parameters when set to hevc
@@ -870,7 +872,7 @@ class Runner:
         anchor_offset = motion[:,-7:-4]
         selected_anchors += anchor_offset
         # Compute anchor rotation from motion output (as quaternion)
-        anchor_rot = torch.nn.functional.normalize(0.1 * motion[:,-4:] + torch.tensor([[1,0,0,0]],device="cuda"))
+        anchor_rot = torch.nn.functional.normalize(0.1 * motion[:,-4:] + torch.tensor([[1,0,0,0]],device=self.device))
         anchor_rotation = quaternion_to_rotation_matrix(anchor_rot)
         # Transform offsets by scale and rotation
         selected_offsets = torch.bmm(selected_offsets.view(-1,self.cfg.n_offsets,3) * selected_scales.unsqueeze(1)[:,:,:3] ,anchor_rotation.reshape((-1,3,3)).transpose(1, 2)).reshape((-1,3))
@@ -1214,8 +1216,10 @@ class Runner:
                         for name, entropy_model in self.compression_sim_method.entropy_models.items():
                             if entropy_model is not None:
                                 data[name+"_entropy_model"] = entropy_model.state_dict()
-                    data["compression_sim"] = self.cfg.compression_sim
-                    data["scaling"] = self.compression_sim_method.scaling
+                    
+                    if self.cfg.compression_sim:
+                        data["compression_sim"] = self.cfg.compression_sim
+                        data["scaling"] = self.compression_sim_method.scaling
                     torch.save(
                         data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
                     )
@@ -1274,6 +1278,7 @@ class Runner:
                 if step in [i - 1 for i in cfg.eval_steps]:
                     self.eval(step)
                     self.render_traj(step)
+                    self.export_ply_sequence(step)
 
                 # run compression
                 if cfg.compression is not None and step in [i - 1 for i in cfg.eval_steps]:
@@ -1374,6 +1379,94 @@ class Runner:
             for k, v in stats.items():
                 self.writer.add_scalar(f"{stage}/{k}", v, step)
             self.writer.flush()
+        self.istraining = training_state
+
+    @torch.no_grad()
+    def export_ply_sequence(self, step: int):
+        """Exports the sequence of neural gaussians to .ply files."""
+        print("Exporting PLY sequence...")
+        training_state = self.istraining
+        self.istraining = False
+        cfg = self.cfg
+        device = self.device
+
+        export_dir = f"{cfg.result_dir}/ply_sequence_{step}"
+        os.makedirs(export_dir, exist_ok=True)
+
+        for frame_idx in tqdm.trange(cfg.GOP_size, desc="Exporting PLY sequence"):
+            time = frame_idx / (cfg.GOP_size - 1)
+            
+            # Use an all-ones mask to consider all anchors
+            visible_anchor_mask = torch.ones(self.splats["anchors"].shape[0], dtype=torch.bool, device=self.device)
+            camtoworlds = torch.eye(4, device=self.device).unsqueeze(0)
+            camera_ids = torch.tensor([0], device=self.device) if cfg.app_opt else None
+
+            # The following logic is a direct copy of get_neural_gaussians
+            selected_anchors = self.splats["anchors"][visible_anchor_mask]
+            selected_offsets = self.splats["offsets"][visible_anchor_mask]
+
+            results = self.decoding_features(
+                camtoworlds, time, visible_anchor_mask, canonical=False, step=-1, camera_ids=camera_ids
+            )
+
+            neural_opacity = results["neural_opacity"]
+            neural_colors = results["neural_colors"]
+            neural_scale_rot = results["neural_scale_rot"]
+            motion = results["motion"]
+            selected_scales = results["selected_scales"]
+
+            neural_selection_mask = (neural_opacity < 0.0).view(-1)
+            neural_opacity[neural_selection_mask] = -1e10
+            
+            anchor_offset = motion[:, -7:-4]
+            # Use a new variable to avoid in-place modification ambiguity
+            moved_anchors = selected_anchors + anchor_offset
+
+            anchor_rot = torch.nn.functional.normalize(
+                0.1 * motion[:, -4:] + torch.tensor([[1, 0, 0, 0]], device=self.device)
+            )
+            anchor_rotation = quaternion_to_rotation_matrix(anchor_rot)
+            
+            transformed_offsets = torch.bmm(
+                selected_offsets.view(-1, self.cfg.n_offsets, 3) * selected_scales.unsqueeze(1)[:, :, :3],
+                anchor_rotation.reshape((-1, 3, 3)).transpose(1, 2),
+            ).reshape((-1, 3))
+
+            scales_repeated = (
+                selected_scales.unsqueeze(1).repeat(1, self.cfg.n_offsets, 1).view(-1, 6)
+            )
+            anchors_repeated = (
+                moved_anchors.unsqueeze(1).repeat(1, self.cfg.n_offsets, 1).view(-1, 3)
+            )
+
+            # Filter all properties based on the opacity mask
+            opacities = neural_opacity.squeeze(-1)
+            colors = neural_colors
+            scale_rot = neural_scale_rot
+            offsets = transformed_offsets
+            scales_rep = scales_repeated
+            anchors_rep = anchors_repeated
+
+            scales = scales_rep[:, 3:] * torch.sigmoid(scale_rot[:, :3])
+            rotation = torch.nn.functional.normalize(scale_rot[:, 3:7])
+            means = anchors_rep + offsets
+
+            filepath = os.path.join(export_dir, f"{frame_idx:04d}.ply")
+            sh0 = rgb2sh(colors).unsqueeze(1)
+            shN = torch.zeros((sh0.shape[0], 0, 3), device=device)
+
+            export_splats(
+                means=means,
+                scales=torch.log(scales.clamp(min=1e-6)),
+                quats=rotation,
+                opacities=opacities,
+                sh0=sh0,
+                shN=shN,
+                save_to=filepath,
+            )
+            # splats_dict = {"means": means, "scales": torch.log(scales.clamp(min=1e-6)), "quats": rotation, "opacities": opacities, "sh0": sh0, "shN": shN}
+            # save_ply(splats_dict, filepath)
+        print(f"Exported PLY sequence to {export_dir}")
         self.istraining = training_state
 
     @torch.no_grad()
@@ -1627,6 +1720,11 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
                 runner.load_entropy_model_from_ckpt(ckpts[0], cfg.entropy_model_type)
             if cfg.knn:
                 _, runner.indices = find_k_neighbors(runner.splats["anchors"], cfg.n_knn)
+            
+            if cfg.export_ply:
+                runner.export_ply_sequence(step=step)
+                return
+
             runner.eval(step=step)
             runner.render_traj(step=step)
             if cfg.compression is not None:
@@ -1733,6 +1831,31 @@ if __name__ == "__main__":
         "default": (
             "GIFStream with compression.",
             Config(
+            ),
+        ),
+        "neur3d_full": (
+            "neur3d dataset",
+            Config(
+                strategy=GIFStreamStrategy(verbose=True,densify_grad_threshold=0.0005,deformation_gate=0.03, refine_stop_iter=30000),
+                test_set=[0],
+                normalize_world_space=False,
+                anchor_feature_dim=48,
+                c_perframe = 24,
+                app_opt=True,
+                app_embed_dim=6,
+                max_steps=50000,
+                time_dim=24,
+                entropy_steps={"anchors": -1, 
+                                "quats": 10_000, 
+                                "scales": 10_000, 
+                                "opacities": 10_000, 
+                                "anchor_features": 10_000, 
+                                "offsets": 10_000,
+                                "factors": 10_000,
+                                "time_features": 10_000,
+                                },
+                entropy_channel=16,
+        
             ),
         ),
     }

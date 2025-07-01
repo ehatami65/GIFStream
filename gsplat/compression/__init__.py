@@ -2,3 +2,4 @@ from .png_compression import PngCompression
 from .hevc_compression import HevcCompression
 from .gifstream_end2end_compression import GIFStreamEnd2endCompression
 from .gifstream_2dcodec_compression import GIFStream2dcodecCompression
+from .compression import Compression

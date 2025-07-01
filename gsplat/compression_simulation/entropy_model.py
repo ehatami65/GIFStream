@@ -467,7 +467,7 @@ class ConditionEntropy(nn.Module):
         bit_stream = decode_x(output_path)
         self.entropy_coder.set_stream(bit_stream)
         if adaptive:
-            x_hat = (self.gaussian_encoder.decode_stream(scalings).cuda() + torch.round(means)) / qs
+            x_hat = (self.gaussian_encoder.decode_stream(scalings).to(means.device) + torch.round(means)) / qs
         else:
-            x_hat = self.gaussian_encoder.decode_stream(scalings).cuda() + torch.round(means)
+            x_hat = self.gaussian_encoder.decode_stream(scalings).to(means.device) + torch.round(means)
         return x_hat

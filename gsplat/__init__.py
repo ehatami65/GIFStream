@@ -1,6 +1,6 @@
 import warnings
 
-from .compression import PngCompression
+from .compression import Compression, PngCompression
 from .optimizers import SelectiveAdam
 from .cuda._torch_impl import accumulate
 from .cuda._torch_impl_2dgs import accumulate_2dgs
@@ -18,6 +18,7 @@ from .cuda._wrapper import (
     rasterize_to_pixels_2dgs,
     rasterize_to_indices_in_range_2dgs,
 )
+from .exporter import export_splats, import_splats, save_ply, load_ply
 from .rendering import (
     rasterization,
     rasterization_2dgs,
@@ -52,4 +53,9 @@ all = [
     "accumulate_2dgs",
     "rasterization_2dgs_inria_wrapper",
     "__version__",
+    "export_splats",
+    "import_splats",
+    "save_ply",
+    "load_ply",
+    "Compression",
 ]

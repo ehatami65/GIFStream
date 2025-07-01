@@ -1,11 +1,11 @@
 # Set the directory containing the scenes
-SCENE_DIR="/data1/hli/dataset/Neur3D"
+SCENE_DIR="/data/shared/aly/data/"
 # Set the directory to store results
-RESULT_DIR="/data1/hli/gscodec/GIFStream_branch"
+RESULT_DIR="/data/shared/aly/GIFStream_branch"
 # Set the rendering trajectory path
 RENDER_TRAJ_PATH="ellipse"
 # List of scenes to process
-SCENE_LIST="flame_salmon_1 coffee_martini sear_steak flame_steak cook_spinach cut_roasted_beef"
+SCENE_LIST="cut_roasted_beef"
 # List of entropy lambda values (rate-distortion tradeoff parameter)
 ENTROPY_LAMBDA_LIST=(0.0005 0.001 0.002 0.004)
 # Data factor for training
@@ -16,6 +16,8 @@ GOP=60
 FIRST_FRAME=0
 # Total number of frames to process
 TOTAL_FRAME=300
+# GPU ID
+GPU_ID=7
 
 # Loop over each scene in the scene list
 for SCENE in $SCENE_LIST;
@@ -44,21 +46,21 @@ do
             MAX_GOP=$((TOTAL_FRAME + FIRST_FRAME - GOP_START_FRAME))
             if ((GOP_ID == 0)); then
                 # If this is the first GOP, train from scratch
-                CUDA_VISIBLE_DEVICES=0 python examples/simple_trainer_GIFStream.py $TYPE --disable_viewer --data_factor $DATA_FACTOR \
+                CUDA_VISIBLE_DEVICES=$GPU_ID python examples/simple_trainer_GIFStream.py $TYPE --disable_viewer --data_factor $DATA_FACTOR \
                     --render_traj_path $RENDER_TRAJ_PATH --data_dir $SCENE_DIR/$SCENE/ --result_dir $EXP_NAME \
                     --eval_steps 7000 30000 --save_steps 7000 30000 \
                     --compression_sim --rd_lambda ${ENTROPY_LAMBDA_LIST[RATE]} --entropy_model_opt --rate $RATE \
                     --batch_size 1 --GOP_size $(( MAX_GOP < GOP ? MAX_GOP : GOP)) --knn --start_frame $GOP_START_FRAME
 
                 # Run evaluation and rendering after training
-                CUDA_VISIBLE_DEVICES=0 python examples/simple_trainer_GIFStream.py $TYPE --disable_viewer --data_factor $DATA_FACTOR \
+                CUDA_VISIBLE_DEVICES=$GPU_ID python examples/simple_trainer_GIFStream.py $TYPE --disable_viewer --data_factor $DATA_FACTOR \
                     --render_traj_path $RENDER_TRAJ_PATH --data_dir $SCENE_DIR/$SCENE/ --result_dir $EXP_NAME \
                     --ckpt $EXP_NAME/ckpts/ckpt_29999_rank0.pt \
                     --compression end2end  --rate $RATE \
                     --GOP_size $(( MAX_GOP < GOP ? MAX_GOP : GOP)) --knn --start_frame $GOP_START_FRAME 
             else
                 # For subsequent GOPs, continue training from first checkpoint
-                CUDA_VISIBLE_DEVICES=0 python examples/simple_trainer_GIFStream.py $TYPE --disable_viewer --data_factor $DATA_FACTOR \
+                CUDA_VISIBLE_DEVICES=$GPU_ID python examples/simple_trainer_GIFStream.py $TYPE --disable_viewer --data_factor $DATA_FACTOR \
                     --render_traj_path $RENDER_TRAJ_PATH --data_dir $SCENE_DIR/$SCENE/ --result_dir $EXP_NAME \
                     --eval_steps 7000 30000 --save_steps 7000 30000 \
                     --compression_sim --rd_lambda ${ENTROPY_LAMBDA_LIST[RATE]} --entropy_model_opt --rate $RATE \
@@ -66,7 +68,7 @@ do
                     --ckpt $RESULT_DIR/${SCENE}/GOP_0/r$RATE/ckpts/ckpt_6999_rank0.pt --continue_training 
 
                 # Run evaluation and rendering after training
-                CUDA_VISIBLE_DEVICES=0 python examples/simple_trainer_GIFStream.py $TYPE --disable_viewer --data_factor $DATA_FACTOR \
+                CUDA_VISIBLE_DEVICES=$GPU_ID python examples/simple_trainer_GIFStream.py $TYPE --disable_viewer --data_factor $DATA_FACTOR \
                     --render_traj_path $RENDER_TRAJ_PATH --data_dir $SCENE_DIR/$SCENE/ --result_dir $EXP_NAME \
                     --ckpt $EXP_NAME/ckpts/ckpt_29999_rank0.pt \
                     --compression end2end  --rate $RATE \
