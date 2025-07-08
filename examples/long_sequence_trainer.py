@@ -37,7 +37,7 @@ import random
 from gsplat.compression import GIFStreamEnd2endCompression, GIFStream2dcodecCompression
 from gsplat.distributed import cli
 from gsplat.rendering import rasterization, view_to_visible_anchors
-from gsplat.strategy import GIFStreamStrategy
+from gsplat.strategy.state_GIFStream import StatefulGIFStreamStrategy
 
 from gsplat.compression_simulation.simulation import GIFStreamCompressionSimulation
 from gsplat.exporter import export_splats, rgb2sh, save_ply
@@ -165,8 +165,8 @@ class Config:
     far_plane: float = 1e10
 
     # Strategy for GS densification
-    strategy: GIFStreamStrategy = field(
-        default_factory=GIFStreamStrategy
+    strategy: StatefulGIFStreamStrategy = field(
+        default_factory=StatefulGIFStreamStrategy
     )
     # Use packed mode for rasterization, this leads to less memory usage but slightly slower.
     packed: bool = False
@@ -213,7 +213,7 @@ class Config:
     # Dimensionality of time-dependent feature per frame
     c_perframe: int = 8
     # GOP size for training
-    GOP_size: int = 50
+    GOP_size: int = 60
     # number of anchors for feature aggregation
     knn: bool = False
     n_knn: int = 6
@@ -236,6 +236,12 @@ class Config:
     continue_training: bool = False
     # rate number
     rate: int = 0
+    # Deformation gate
+    deformation_gate: float = 0.03
+    # New parameters for long sequence training
+    max_total_anchors: int = 70_000
+    static_anchor_threshold: float = 0.001
+    total_frames: int = 300
     # quantization scalings
     compression_scaling = [
         {
@@ -286,7 +292,7 @@ class Config:
         self.max_steps = int(self.max_steps * factor)
 
         strategy = self.strategy
-        if isinstance(strategy, GIFStreamStrategy):
+        if isinstance(strategy, StatefulGIFStreamStrategy):
             strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
             strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
             strategy.refine_every = int(strategy.refine_every * factor)
@@ -321,8 +327,9 @@ def create_splats_with_optimizers(
     GOP_size: int = 50,
     n_knn: int = 8,
     time_dim: int = 16,
-    view_adaptive: bool = False
-) -> Tuple[torch.nn.ParameterDict, torch.nn.ModuleDict, Dict[str, torch.optim.Optimizer], Dict[str, torch.optim.Optimizer]]:
+    view_adaptive: bool = False,
+    max_total_anchors: int = 60_000,
+) -> Tuple[torch.nn.ParameterDict, torch.nn.ModuleDict, Dict[str, torch.optim.Optimizer], Dict[str, torch.optim.Optimizer], torch.Tensor]:
     if init_type == "sfm":
         points = parser.points
         np.random.shuffle(points)
@@ -338,26 +345,40 @@ def create_splats_with_optimizers(
     # Distribute the GSs to different ranks (also works for single rank)
     points = points[world_rank::world_size]
     scales = scales[world_rank::world_size]
-
-    N = points.shape[0]
-    quats = torch.zeros((N, 4))  # [N, 4]
-    quats[:,0] = 1
-    opacities = torch.logit(torch.full((N,1), init_opacity))  # [N,]
-    anchor_features = torch.zeros((N, anchor_feature_dim))
-    offsets = torch.zeros((N, n_offsets, 3))
-    time_features = torch.zeros((N, GOP_size, c_perframe))
-    factors = torch.zeros((N, 4)) # [time_feature factor, motion_factor, knn_factor, pruning_factor]
     
+    N_init = points.shape[0]
+    assert N_init <= max_total_anchors, f"Initial points ({N_init}) exceed max_total_anchors ({max_total_anchors})"
+
+    # Initialize tensors for the entire pool
+    pool_anchors = torch.zeros(max_total_anchors, 3, device=device)
+    pool_scales = torch.zeros(max_total_anchors, 6, device=device)
+    pool_quats = torch.zeros(max_total_anchors, 4, device=device)
+    pool_opacities = torch.zeros(max_total_anchors, 1, device=device)
+    pool_anchor_features = torch.zeros(max_total_anchors, anchor_feature_dim, device=device)
+    pool_offsets = torch.zeros(max_total_anchors, n_offsets, 3, device=device)
+    pool_time_features = torch.zeros(max_total_anchors, GOP_size, c_perframe, device=device)
+    pool_factors = torch.zeros(max_total_anchors, 4, device=device)
+    
+    # Copy initial data into the pool
+    pool_anchors[:N_init] = points.to(device)
+    pool_scales[:N_init] = scales.to(device)
+    pool_quats[:N_init, 0] = 1.0
+    pool_opacities[:N_init] = torch.logit(torch.full((N_init,1), init_opacity)).to(device)
+    
+    # Create the active mask
+    active_mask = torch.zeros(max_total_anchors, dtype=torch.bool, device=device)
+    active_mask[:N_init] = True
+
     params = [
         # name, value, lr
-        ("anchors", torch.nn.Parameter(points), 0),
-        ("scales", torch.nn.Parameter(scales.requires_grad_(True)), 7e-3),
-        ("quats", torch.nn.Parameter(quats), 0),
-        ("opacities", torch.nn.Parameter(opacities), 0),
-        ("offsets", torch.nn.Parameter(offsets.requires_grad_(True)), 1e-2),
-        ("anchor_features", torch.nn.Parameter(anchor_features.requires_grad_(True)), 0.0075),
-        ("time_features", torch.nn.Parameter(time_features.requires_grad_(True)), 0.0075),
-        ("factors", torch.nn.Parameter(factors.requires_grad_(True)), 1e-3),
+        ("anchors", torch.nn.Parameter(pool_anchors), 0),
+        ("scales", torch.nn.Parameter(pool_scales.requires_grad_(True)), 7e-3),
+        ("quats", torch.nn.Parameter(pool_quats), 0),
+        ("opacities", torch.nn.Parameter(pool_opacities), 0),
+        ("offsets", torch.nn.Parameter(pool_offsets.requires_grad_(True)), 1e-2),
+        ("anchor_features", torch.nn.Parameter(pool_anchor_features.requires_grad_(True)), 0.0075),
+        ("time_features", torch.nn.Parameter(pool_time_features.requires_grad_(True)), 0.0075),
+        ("factors", torch.nn.Parameter(pool_factors.requires_grad_(True)), 1e-3),
     ]
 
     view_dim = 3 if view_adaptive else 0
@@ -428,7 +449,7 @@ def create_splats_with_optimizers(
         )
         for name, _, lr in net_params
     }
-    return splats, decoders, optimizers, decoder_optimizers
+    return splats, decoders, optimizers, decoder_optimizers, active_mask
 
 class Runner:
     """Engine for training and testing."""
@@ -467,23 +488,15 @@ class Runner:
             test_every=cfg.test_every,
             first_frame=cfg.start_frame,
         )
-        self.trainset = Dataset(
-            self.parser,
-            split="train",
-            patch_size=cfg.patch_size,
-            load_depths=False,
-            test_set=cfg.test_set,
-            remove_set=cfg.remove_set,
-            GOP_size=cfg.GOP_size,
-            start_frame=cfg.start_frame,
-        )
-        self.valset = Dataset(self.parser, split="val", test_set=cfg.test_set, remove_set=cfg.remove_set, GOP_size=cfg.GOP_size, start_frame=cfg.start_frame)
+        # Trainset and Valset will be initialized in the main training loop
+        self.trainset = None
+        self.valset = None
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
         # Model
         app_embed_dim = cfg.app_embed_dim if cfg.app_opt else 0
-        self.splats,self.decoders, self.optimizers, self.net_optimizers = create_splats_with_optimizers(
+        self.splats,self.decoders, self.optimizers, self.net_optimizers, self.active_mask = create_splats_with_optimizers(
             self.parser,
             init_type=cfg.init_type,
             init_num_pts=cfg.init_num_pts,
@@ -510,22 +523,22 @@ class Runner:
             GOP_size=cfg.GOP_size,
             n_knn=cfg.n_knn,
             time_dim=cfg.time_dim,
-            view_adaptive=cfg.view_adaptive
+            view_adaptive=cfg.view_adaptive,
+            max_total_anchors=cfg.max_total_anchors,
         )
-        print("Model initialized. Number of Anchor:", len(self.splats["anchors"]))
+        
+        # Initialize state masks
+        self.static_slots = torch.zeros(cfg.max_total_anchors, dtype=torch.bool, device=self.device)
+        self.dynamic_slots = torch.ones(cfg.max_total_anchors, dtype=torch.bool, device=self.device)
+
+        print("Model initialized. Anchor Pool Size:", cfg.max_total_anchors)
+        print("Initial Active Anchors:", self.active_mask.sum().item())
+
 
         # Densification Strategy
+        self.strategy_state = None # Initialized in train()
         self.cfg.strategy.check_sanity(self.splats, self.optimizers)
 
-        if isinstance(self.cfg.strategy, GIFStreamStrategy):
-            self.strategy_state = self.cfg.strategy.initialize_state(
-                scene_scale=self.scene_scale,
-                n_offsets=cfg.n_offsets,
-                voxel_size=cfg.voxel_size,
-                anchor_feature_dim=cfg.anchor_feature_dim
-            )
-        else:
-            assert_never(self.cfg.strategy)
 
         # Compression Strategy
         self.compression_method = None
@@ -567,8 +580,10 @@ class Runner:
         self.app_optimizers = []
         if cfg.app_opt:
             assert cfg.app_embed_dim > 0
+            # Note: app_module size depends on total cameras, needs careful handling for long sequences if not all cameras are known upfront.
+            # Assuming parser provides all camera info for the entire sequence.
             self.app_module = CameraEmbedding(
-                self.trainset.cameras_length, cfg.app_embed_dim
+                len(self.parser.camera_names), cfg.app_embed_dim
             ).to(self.device)
             self.app_optimizers = [
                 torch.optim.Adam(
@@ -812,7 +827,7 @@ class Runner:
             Dict: A dictionary containing the parameters of visible neural Gaussians, including means, colors, opacities, scales, rotations, and auxiliary losses.
         """
         # Compute which anchors (Gaussians) are visible in the current view
-        visible_anchor_mask = view_to_visible_anchors(
+        view_visible_mask = view_to_visible_anchors(
             means=self.splats["anchors"],
             quats=self.splats["quats"],
             scales=torch.exp(self.splats["scales"][:, :3]),
@@ -823,9 +838,17 @@ class Runner:
             packed=packed,
             rasterize_mode=rasterize_mode,
         )
+        # --- START MODIFICATION ---
+        # Combine with the active mask for efficiency during training
+        visible_anchor_mask = view_visible_mask & self.active_mask
+
+        # Get the global indices of the anchors that are visible in this view.
+        visible_anchor_global_indices = visible_anchor_mask.nonzero(as_tuple=False).squeeze(-1)
+        # --- END MODIFICATION ---
 
         # Select anchors and offsets for visible Gaussians
         if not self.cfg.compression_sim:
+            # We now filter based on the combined mask
             selected_anchors = self.splats["anchors"][visible_anchor_mask]  # [M, 3]
             selected_offsets = self.splats["offsets"][visible_anchor_mask]  # [M, k, 3]
         else:
@@ -868,6 +891,19 @@ class Runner:
         
         # Mask out Gaussians with non-positive opacity (they do not contribute to rendering)
         neural_selection_mask = (neural_opacity > 0.0).view(-1)  # [M*k]
+
+        # --- START MODIFICATION ---
+        # Create mappings from the final rendered primitives back to their parent anchor's global index.
+        parent_anchor_indices_repeated = visible_anchor_global_indices.unsqueeze(1).repeat(1, self.cfg.n_offsets).view(-1)
+        parent_anchor_indices_for_primitives = parent_anchor_indices_repeated[neural_selection_mask]
+
+        # Also, get the global index for each offset.
+        global_offset_base_indices = visible_anchor_global_indices * self.cfg.n_offsets
+        offset_increments = torch.arange(self.cfg.n_offsets, device=self.device)
+        parent_offset_indices_repeated = (global_offset_base_indices.unsqueeze(1) + offset_increments).view(-1)
+        parent_offset_indices_for_primitives = parent_offset_indices_repeated[neural_selection_mask]
+        # --- END MODIFICATION ---
+        
         # Apply motion offset to anchor positions
         anchor_offset = motion[:,-7:-4]
         selected_anchors += anchor_offset
@@ -879,8 +915,6 @@ class Runner:
         # Repeat scales and anchors for each offset
         scales_repeated = (selected_scales.unsqueeze(1).repeat(1, self.cfg.n_offsets, 1).view(-1, 6))  # [M*k, 6]
         anchors_repeated = (selected_anchors.unsqueeze(1).repeat(1, self.cfg.n_offsets, 1).view(-1, 3))  # [M*k, 3]
-        # Combine neural and anchor rotations
-        # neural_scale_rot = torch.cat([neural_scale_rot[:,:3],quaternion_multiply(anchor_rot.unsqueeze(1).expand([-1,self.cfg.n_offsets,-1]).flatten(0,1), neural_scale_rot[:, 3:7])],dim=-1)
         
         # Apply mask to select valid Gaussians
         selected_opacity = neural_opacity[neural_selection_mask].squeeze(-1)  # [M]
@@ -910,6 +944,11 @@ class Runner:
             "reg_loss": selected_factors[:,:-1].mean() + 0.1 * selected_factors[:,-1].mean() if regular else 0,  # Regularization loss
             "smooth_loss": smooth_loss,# Smoothness loss
             "motion": anchor_offset,  # Anchor offset
+            # --- START MODIFICATION ---
+            # Add the new index mappings to the returned dictionary
+            "parent_anchor_indices": parent_anchor_indices_for_primitives,
+            "global_offset_indices": parent_offset_indices_for_primitives,
+            # --- END MODIFICATION ---
         }
         return info
 
@@ -964,7 +1003,7 @@ class Runner:
             packed=self.cfg.packed,
             absgrad=(
                 self.cfg.strategy.absgrad
-                if isinstance(self.cfg.strategy, GIFStreamStrategy)
+                if isinstance(self.cfg.strategy, StatefulGIFStreamStrategy)
                 else False
             ),
             sparse_grad=False,
@@ -975,6 +1014,9 @@ class Runner:
         )
         if masks is not None:
             render_colors[~masks] = 0
+            
+        # --- START MODIFICATION ---
+        # Pass through all necessary info from neural_gaussians to the final info dict
         info["anchor_visible_mask"] = neural_gaussians["anchor_visible_mask"]
         info["neural_selection_mask"] = neural_gaussians["neural_selection_mask"]
         info["update_filter"] = info["radii"] > 0
@@ -985,9 +1027,14 @@ class Runner:
         info["gop"] = self.cfg.GOP_size
         info["time"] = int(time * (self.cfg.GOP_size - 1))
         info["motion"] = neural_gaussians["motion"]
+        # Ensure the new index mappings are passed through
+        info["parent_anchor_indices"] = neural_gaussians["parent_anchor_indices"]
+        info["global_offset_indices"] = neural_gaussians["global_offset_indices"]
+        # --- END MODIFICATION ---
+
         return render_colors, render_alphas, info
 
-    def train(self, init_step: int=0):
+    def train(self, gop_index: int, init_step: int=0):
         self.istraining = True
         cfg = self.cfg
         device = self.device
@@ -995,9 +1042,23 @@ class Runner:
         world_size = self.world_size
 
         # Dump cfg.
-        if world_rank == 0:
+        if world_rank == 0 and gop_index == 0:
             with open(f"{cfg.result_dir}/cfg.yml", "w") as f:
                 yaml.dump(vars(cfg), f)
+
+        # --- START MODIFICATION 1 ---
+        # Initialize strategy state for the current GOP, passing stateful masks
+        self.strategy_state = self.cfg.strategy.initialize_state(
+            scene_scale=self.scene_scale,
+            n_offsets=cfg.n_offsets,
+            voxel_size=cfg.voxel_size,
+            active_mask=self.active_mask,
+            static_slots=self.static_slots,
+            dynamic_slots=self.dynamic_slots,
+            gop_size=cfg.GOP_size,
+            max_total_anchors=cfg.max_total_anchors,
+        )
+        # --- END MODIFICATION 1 ---
 
         max_steps = cfg.max_steps
         init_step = init_step
@@ -1038,7 +1099,7 @@ class Runner:
 
             # Training loop.
             global_tic = time.time()
-            pbar = tqdm.tqdm(range(init_step, max_steps))
+            pbar = tqdm.tqdm(range(init_step, max_steps), desc=f"GOP {gop_index}")
             for step in pbar:
                 if not cfg.disable_viewer:
                     while self.viewer.state.status == "paused":
@@ -1051,7 +1112,7 @@ class Runner:
                 except StopIteration:
                     trainloader_iter = iter(trainloader)
                     batch_data = next(trainloader_iter)
-                if step == int(max_steps * self.cfg.strategy.deformation_gate):
+                if gop_index == 0 and step == int(max_steps * self.cfg.deformation_gate):
                     self.init_dynamic()
                 
                 #* batch forward
@@ -1101,8 +1162,8 @@ class Runner:
                         render_mode="RGB",
                         masks=masks,
                         time=float(data["time"]),
-                        canonical= (step <= int(max_steps * self.cfg.strategy.deformation_gate)),
-                        regular= (step > int(max_steps * (self.cfg.strategy.deformation_gate + 0.1))),
+                        canonical= (gop_index == 0 and step <= int(max_steps * self.cfg.deformation_gate)),
+                        regular= (gop_index > 0 or step > int(max_steps * (self.cfg.deformation_gate + 0.1))),
                         step=step,
                         camera_ids=camera_ids,
                     )
@@ -1153,76 +1214,66 @@ class Runner:
                     loss.backward()
                     info_list.append(info)
                 
-                desc = f"loss={loss_show.item():.3f}| " f"sh degree={sh_degree_to_use}| "
+                desc = f"GOP {gop_index} | loss={loss_show.item():.3f}| sh degree={sh_degree_to_use}| "
                 pbar.set_description(desc)
 
                 # tensorboard monitor
                 if world_rank == 0 and cfg.tb_every > 0 and step % cfg.tb_every == 0:
+                    global_step = gop_index * max_steps + step
                     mem = torch.cuda.max_memory_allocated() / 1024**3
-                    self.writer.add_scalar("train/loss", loss.item(), step)
-                    self.writer.add_scalar("train/scale_loss", scale_loss.item(), step)
-                    self.writer.add_scalar("train/reg_loss", reg_loss.item() if reg_loss>0 else reg_loss, step)
-                    self.writer.add_scalar("train/smooth_loss", smooth_loss.item() if smooth_loss>0 else smooth_loss, step)
-                    self.writer.add_scalar("train/l1loss", l1loss.item(), step)
-                    self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
-                    self.writer.add_scalar("train/num_anchor", len(self.splats["anchors"]), step)
-                    self.writer.add_scalar("train/mem", mem, step)
+                    self.writer.add_scalar("train/loss", loss.item(), global_step)
+                    self.writer.add_scalar("train/scale_loss", scale_loss.item(), global_step)
+                    self.writer.add_scalar("train/reg_loss", reg_loss.item() if reg_loss>0 else reg_loss, global_step)
+                    self.writer.add_scalar("train/smooth_loss", smooth_loss.item() if smooth_loss>0 else smooth_loss, global_step)
+                    self.writer.add_scalar("train/l1loss", l1loss.item(), global_step)
+                    self.writer.add_scalar("train/ssimloss", ssimloss.item(), global_step)
+                    self.writer.add_scalar("train/num_anchor", self.active_mask.sum().item(), global_step)
+                    self.writer.add_scalar("train/mem", mem, global_step)
                     if self.cfg.compression_sim:
-                        self.writer.add_scalar("train/dynamic", (self.comp_sim_splats["factors"][:,0] > 0).to(torch.float32).mean(), step)
-                        self.writer.add_scalar("train/dynamic_", torch.logical_or((self.comp_sim_splats["factors"][:,0] > 0),(self.comp_sim_splats["factors"][:,1] > 0)).to(torch.float32).mean(), step)
-                        self.writer.add_scalar("train/pruning", (self.comp_sim_splats["factors"][:,-1] > 0).to(torch.float32).mean(), step)
+                        self.writer.add_scalar("train/dynamic", (self.comp_sim_splats["factors"][:,0] > 0).to(torch.float32).mean(), global_step)
+                        self.writer.add_scalar("train/dynamic_", torch.logical_or((self.comp_sim_splats["factors"][:,0] > 0),(self.comp_sim_splats["factors"][:,1] > 0)).to(torch.float32).mean(), global_step)
+                        self.writer.add_scalar("train/pruning", (self.comp_sim_splats["factors"][:,-1] > 0).to(torch.float32).mean(), global_step)
                     if cfg.tb_save_image:
                         canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
                         canvas = canvas.reshape(-1, *canvas.shape[2:])
-                        self.writer.add_image("train/render", canvas, step)
+                        self.writer.add_image("train/render", canvas, global_step)
                     if cfg.compression_sim:
                         if cfg.entropy_model_opt and step>self.entropy_min_step:
-                            self.writer.add_histogram("train_hist/quats", self.splats["quats"], step)
-                            self.writer.add_histogram("train_hist/scales", self.splats["scales"], step)
-                            self.writer.add_histogram("train_hist/anchor_features", self.splats["anchor_features"], step)
-                            self.writer.add_histogram("train_hist/offsets", self.splats["offsets"], step)
-                            self.writer.add_histogram("train_hist/factors", self.splats["factors"], step)
+                            self.writer.add_histogram("train_hist/quats", self.splats["quats"], global_step)
+                            self.writer.add_histogram("train_hist/scales", self.splats["scales"], global_step)
+                            self.writer.add_histogram("train_hist/anchor_features", self.splats["anchor_features"], global_step)
+                            self.writer.add_histogram("train_hist/offsets", self.splats["offsets"], global_step)
+                            self.writer.add_histogram("train_hist/factors", self.splats["factors"], global_step)
                             if total_esti_bits > 0:
-                                self.writer.add_scalar("train/bpp_loss", total_esti_bits.item(), step)
+                                self.writer.add_scalar("train/bpp_loss", total_esti_bits.item(), global_step)
                         
-                    self.writer.add_histogram("train_hist/means", self.splats["anchors"], step)
+                    self.writer.add_histogram("train_hist/means", self.splats["anchors"], global_step)
                     self.writer.flush()
 
                 # save checkpoint before updating the model
                 if step in [i - 1 for i in cfg.save_steps] or step == max_steps - 1:
-                    mem = torch.cuda.max_memory_allocated() / 1024**3
-                    stats = {
-                        "mem": mem,
-                        "ellipse_time": time.time() - global_tic,
-                        "num_GS": len(self.splats["anchors"]),
-                    }
-                    print("Step: ", step, stats)
-                    with open(
-                        f"{self.stats_dir}/train_step{step:04d}_rank{self.world_rank}.json",
-                        "w",
-                    ) as f:
-                        json.dump(stats, f)
-                    
-                    # prepare data to be saved
-                    data = {"step": step, "splats": self.splats.state_dict(), "decoders": self.decoders.state_dict()}
-                    if cfg.app_opt:
-                        if world_size > 1:
-                            data["app_module"] = self.app_module.module.state_dict()
-                        else:
-                            data["app_module"] = self.app_module.state_dict()
+                    pass # Checkpointing handled by the master loop
 
-                    if cfg.compression_sim and cfg.entropy_model_opt:
-                        self.entropy_models = self.compression_sim_method.entropy_models
-                        for name, entropy_model in self.compression_sim_method.entropy_models.items():
-                            if entropy_model is not None:
-                                data[name+"_entropy_model"] = entropy_model.state_dict()
-                    
-                    if self.cfg.compression_sim:
-                        data["compression_sim"] = self.cfg.compression_sim
-                        data["scaling"] = self.compression_sim_method.scaling
-                    torch.save(
-                        data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
-                    )
+                # --- START MODIFICATION 2 ---
+                # Freeze static anchors for GOPs > 0
+                if gop_index > 0:
+                    with torch.no_grad():
+                        static_indices = self.static_slots
+                        # We only need to freeze parameters that are being optimized.
+                        # 'anchors', 'quats', 'opacities' have lr=0.
+                        if self.splats["scales"].grad is not None:
+                            self.splats["scales"].grad[static_indices] = 0.0
+                        if self.splats["offsets"].grad is not None:
+                            self.splats["offsets"].grad[static_indices] = 0.0
+                        if self.splats["anchor_features"].grad is not None:
+                            self.splats["anchor_features"].grad[static_indices] = 0.0
+                        if self.splats["time_features"].grad is not None:
+                            # Static anchors should not have time-varying features
+                            self.splats["time_features"].grad[static_indices] = 0.0
+                        if self.splats["factors"].grad is not None:
+                            # Factors for static anchors should also be frozen
+                            self.splats["factors"].grad[static_indices] = 0.0
+                # --- END MODIFICATION 2 ---
 
                 # optimize
                 for optimizer in self.optimizers.values():
@@ -1251,17 +1302,19 @@ class Runner:
                                 scheduler.step()
 
                 # Run post-backward steps after backward and optimizer
-                if isinstance(self.cfg.strategy, GIFStreamStrategy):
+                if isinstance(self.cfg.strategy, StatefulGIFStreamStrategy):
                     self.cfg.strategy.step_post_backward(
                         params=self.splats,
                         optimizers=self.optimizers,
                         state=self.strategy_state,
                         step=step,
                         info=info_list,
-                        packed=cfg.packed,
-                        mask=(self.comp_sim_splats["factors"][:,-1] == 0) if self.cfg.compression_sim else None,
-                        max_steps=self.cfg.max_steps
+                        gop_index=gop_index,
                     )
+                    # --- START MODIFICATION 3 ---
+                    # Sync the active mask from the strategy back to the runner
+                    self.active_mask = self.cfg.strategy.active_mask
+                    # --- END MODIFICATION 3 ---
                 else:
                     assert_never(self.cfg.strategy)
 
@@ -1276,13 +1329,14 @@ class Runner:
 
                 # eval the full set
                 if step in [i - 1 for i in cfg.eval_steps]:
-                    self.eval(step)
-                    self.render_traj(step)
-                    self.export_ply_sequence(step)
+                    self.eval(gop_index * max_steps + step)
+                    self.render_traj(gop_index * max_steps + step)
+                    if self.cfg.export_ply:
+                        self.export_ply_sequence(gop_index * max_steps + step)
 
                 # run compression
                 if cfg.compression is not None and step in [i - 1 for i in cfg.eval_steps]:
-                    self.run_compression(step=step)
+                    self.run_compression(step=gop_index * max_steps + step)
 
                 if not cfg.disable_viewer:
                     self.viewer.lock.release()
@@ -1293,9 +1347,136 @@ class Runner:
                     # Update the viewer state.
                     self.viewer.state.num_train_rays_per_sec = num_train_rays_per_sec
                     # Update the scene.
-                    self.viewer.update(step, num_train_rays_per_step)
+                    self.viewer.update(gop_index * max_steps + step, num_train_rays_per_step)
         self.istraining = False
         
+
+    @torch.no_grad()
+    def _compute_final_motion(self, dynamic_mask: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        A simplified version of decoding_features to compute the motion of dynamic anchors
+        at the very end of a GOP (t=1.0).
+        """
+        # 1. Get features for the specified dynamic anchors
+        selected_features = self.splats["anchor_features"][dynamic_mask]
+        selected_factors = self.splats["factors"][dynamic_mask]
+        
+        # At t=1.0, the time feature index is the last one in the GOP
+        feat_start_idx = self.cfg.GOP_size - 1
+        selected_time_features = self.splats["time_features"][dynamic_mask][:, feat_start_idx]
+
+        # 2. Create the time embedding for t=1.0
+        time = torch.tensor([1.0], device=self.device)
+        time_embedding = torch.cat(
+            [torch.sin(self.cfg.phi**n * torch.pi * time) for n in range(self.cfg.time_dim // 2)] +
+            [torch.cos(self.cfg.phi**n * torch.pi * time) for n in range(self.cfg.time_dim // 2)]
+        )
+
+        # 3. Construct the input for the motion MLP
+        time_feature_factor = selected_factors[:, 0].unsqueeze(-1)
+        
+        # This logic is adapted from decoding_features, omitting view/knn specifics for this task
+        time_adaptive_features = torch.cat([
+            selected_features,
+            selected_time_features * time_feature_factor
+        ], dim=-1)
+        time_adaptive_features = torch.cat([
+            time_adaptive_features,
+            time_embedding.unsqueeze(0).expand(time_adaptive_features.shape[0], -1)
+        ], dim=1)
+
+        # 4. Forward pass through the motion MLP
+        motion = self.decoders["mlp_motion"](time_adaptive_features)
+        motion_factor = selected_factors[:, 1].unsqueeze(-1)
+        motion = motion * motion_factor
+
+        # 5. Extract final position and rotation updates
+        position_offset = motion[:, -7:-4]
+        
+        # The motion MLP outputs a deviation from the identity quaternion
+        base_quat = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=self.device).expand(motion.shape[0], -1)
+        rotation_update_raw = 0.1 * motion[:, -4:]
+        rotation_quat = torch.nn.functional.normalize(base_quat + rotation_update_raw)
+
+        return {"position_offset": position_offset, "rotation_quat": rotation_quat}
+    
+    def _reinitialize_optimizers(self):
+        """Re-initializes all optimizers to reset their state (e.g., momentum)."""
+        cfg = self.cfg
+        BS = cfg.batch_size * self.world_size
+        optimizer_class = torch.optim.Adam
+
+        # Define learning rates, mirroring the setup in create_splats_with_optimizers
+        params_lr_config = {
+            "anchors": 0, "scales": 7e-3, "quats": 0, "opacities": 0,
+            "offsets": 1e-2, "anchor_features": 0.0075,
+            "time_features": 0.0075, "factors": 1e-3
+        }
+        net_params_lr_config = {
+            "mlp_opacity": 2e-3, "mlp_cov": 4e-3,
+            "mlp_color": 8e-3, "mlp_motion": 8e-3
+        }
+
+        self.optimizers = {
+            name: optimizer_class(
+                [{"params": self.splats[name], "lr": lr * math.sqrt(BS), "name": name}],
+                eps=1e-15 / math.sqrt(BS),
+                betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
+            )
+            for name, lr in params_lr_config.items()
+        }
+        self.net_optimizers = {
+            name: optimizer_class(
+                [{"params": self.decoders[name].parameters(), "lr": lr * math.sqrt(BS), "name": name}],
+                eps=1e-15 / math.sqrt(BS),
+                betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
+            )
+            for name, lr in net_params_lr_config.items()
+        }
+
+        if cfg.app_opt:
+            self.app_optimizers = [
+                torch.optim.Adam(
+                    self.app_module.embeds.parameters(),
+                    lr=cfg.app_opt_lr * math.sqrt(cfg.batch_size) * 10.0,
+                    weight_decay=cfg.app_opt_reg,
+                ),
+            ]
+        else:
+            self.app_optimizers = []
+            
+    @torch.no_grad()
+    def prepare_for_next_gop(self):
+        """Prepares the model state for the transition to the next GOP."""
+        print("\n--- Preparing state for the next GOP ---")
+
+        # 1. Identify active dynamic anchors to be updated
+        dynamic_mask = self.dynamic_slots & self.active_mask
+        if not dynamic_mask.any():
+            print("No dynamic anchors to update. Proceeding.")
+            return
+
+        # 2. "Bake in" the final motion from the previous GOP's last frame
+        final_motion = self._compute_final_motion(dynamic_mask)
+        pos_offset = final_motion["position_offset"]
+        rot_quat = final_motion["rotation_quat"]
+
+        # Apply updates to the canonical state of dynamic anchors
+        self.splats["anchors"].data[dynamic_mask] += pos_offset
+        self.splats["quats"].data[dynamic_mask] = quaternion_multiply(
+            self.splats["quats"].data[dynamic_mask], rot_quat
+        )
+        print(f"Updated canonical positions/rotations for {dynamic_mask.sum().item()} dynamic anchors.")
+
+        # 3. Reset transient, GOP-specific features for dynamic anchors
+        self.splats["time_features"].data[dynamic_mask].zero_()
+        # Reset dynamic, motion, and knn factors (channels 0, 1, 2) but keep pruning factor
+        self.splats["factors"].data[dynamic_mask, :3] = 0.0
+        print("Reset time features and dynamic factors for the next GOP.")
+
+        # 4. Re-initialize optimizers for a clean training start
+        self._reinitialize_optimizers()
+        print("Re-initialized optimizers for a fresh start.")
 
     @torch.no_grad()
     def eval(self, step: int, stage: str = "val"):
@@ -1364,7 +1545,7 @@ class Runner:
             stats.update(
                 {
                     "ellipse_time": ellipse_time,
-                    "num_GS": len(self.splats["anchors"]),
+                    "num_GS": self.active_mask.sum().item(),
                 }
             )
             print(
@@ -1397,16 +1578,15 @@ class Runner:
             time = frame_idx / (cfg.GOP_size - 1)
             
             # Use an all-ones mask to consider all anchors
-            visible_anchor_mask = torch.ones(self.splats["anchors"].shape[0], dtype=torch.bool, device=self.device)
             camtoworlds = torch.eye(4, device=self.device).unsqueeze(0)
             camera_ids = torch.tensor([0], device=self.device) if cfg.app_opt else None
 
             # The following logic is a direct copy of get_neural_gaussians
-            selected_anchors = self.splats["anchors"][visible_anchor_mask]
-            selected_offsets = self.splats["offsets"][visible_anchor_mask]
+            selected_anchors = self.splats["anchors"][self.active_mask]
+            selected_offsets = self.splats["offsets"][self.active_mask]
 
             results = self.decoding_features(
-                camtoworlds, time, visible_anchor_mask, canonical=False, step=-1, camera_ids=camera_ids
+                camtoworlds, time, self.active_mask, canonical=False, step=-1, camera_ids=camera_ids
             )
 
             neural_opacity = results["neural_opacity"]
@@ -1417,7 +1597,8 @@ class Runner:
 
             neural_selection_mask = (neural_opacity < 0.0).view(-1)
             neural_opacity[neural_selection_mask] = -1e10
-            
+            active_primitive_mask = self.active_mask.unsqueeze(1).repeat(1, cfg.n_offsets).view(-1, 1)
+            neural_opacity[~active_primitive_mask] = -1e10 # Set to large negative in logit space
             anchor_offset = motion[:, -7:-4]
             # Use a new variable to avoid in-place modification ambiguity
             moved_anchors = selected_anchors + anchor_offset
@@ -1554,13 +1735,13 @@ class Runner:
         print("Running compression...")
         world_rank = self.world_rank
 
-        compress_dir = f"{cfg.result_dir}/compression/rank{world_rank}"
+        compress_dir = f"{self.cfg.result_dir}/compression/rank{world_rank}"
 
         if os.path.exists(compress_dir):
             shutil.rmtree(compress_dir)
         os.makedirs(compress_dir)
 
-        self.run_param_distribution_vis(self.splats, save_dir=f"{cfg.result_dir}/visualization/raw")
+        self.run_param_distribution_vis(self.splats, save_dir=f"{self.cfg.result_dir}/visualization/raw")
         
         if isinstance(self.compression_method, GIFStreamEnd2endCompression):
             self.compression_method.compress(compress_dir, self.comp_sim_splats, self.entropy_models, self.cfg.entropy_channel, self.cfg.c_perframe, self.scaling, self.cfg.voxel_size)
@@ -1579,7 +1760,7 @@ class Runner:
             self.load_models_from_compressed_dir(compress_dir, self.cfg.entropy_model_type)
         splats_c = self.compression_method.decompress(compress_dir, self.entropy_models, self.device)
         
-        self.run_param_distribution_vis(splats_c, save_dir=f"{cfg.result_dir}/visualization/quant")
+        self.run_param_distribution_vis(splats_c, save_dir=f"{self.cfg.result_dir}/visualization/quant")
         for k in splats_c.keys():
             self.splats[k].data = splats_c[k].to(self.device)
         if self.cfg.knn:
@@ -1673,6 +1854,43 @@ class Runner:
         self.compression_sim_method.scaling = ckpt["scaling"]
         self.scaling = ckpt["scaling"]
         self.decoders.load_state_dict(ckpt["decoders"])
+    
+    def save_gop_checkpoint(self, path: str):
+        """Saves a checkpoint including model state and stateful masks."""
+        data_to_save = {
+            "splats": self.splats.state_dict(),
+            "decoders": self.decoders.state_dict(),
+            "optimizers": {name: opt.state_dict() for name, opt in self.optimizers.items()},
+            "net_optimizers": {name: opt.state_dict() for name, opt in self.net_optimizers.items()},
+            "active_mask": self.active_mask,
+            "static_slots": self.static_slots,
+            "dynamic_slots": self.dynamic_slots,
+        }
+        if self.cfg.app_opt:
+            data_to_save["app_module"] = self.app_module.state_dict()
+        
+        torch.save(data_to_save, path)
+
+    def load_gop_checkpoint(self, path: str):
+        """Loads a checkpoint including model state and stateful masks."""
+        ckpt = torch.load(path, map_location=self.device)
+        
+        self.splats.load_state_dict(ckpt["splats"])
+        self.decoders.load_state_dict(ckpt["decoders"])
+        
+        for name, opt in self.optimizers.items():
+            if name in ckpt["optimizers"]:
+                opt.load_state_dict(ckpt["optimizers"][name])
+        for name, opt in self.net_optimizers.items():
+            if name in ckpt["net_optimizers"]:
+                opt.load_state_dict(ckpt["net_optimizers"][name])
+        
+        self.active_mask = ckpt["active_mask"].to(self.device)
+        self.static_slots = ckpt["static_slots"].to(self.device)
+        self.dynamic_slots = ckpt["dynamic_slots"].to(self.device)
+
+        if self.cfg.app_opt and "app_module" in ckpt:
+            self.app_module.load_state_dict(ckpt["app_module"])
 
     @torch.no_grad()
     def _viewer_render_fn(
@@ -1695,61 +1913,88 @@ class Runner:
         )  # [1, H, W, 3]
         return render_colors[0].cpu().numpy()
 
+    @torch.no_grad()
+    def analyze_and_partition_anchors(self):
+        """
+        Analyzes anchor factors after GOP 0 to classify them as static or dynamic.
+        This sets the `static_slots` and `dynamic_slots` masks for subsequent GOPs.
+        """
+        print("--- Analyzing GOP 0 to establish static/dynamic split ---")
+        
+        active_anchors_factors = self.splats["factors"][self.active_mask]
+        
+        # A low value for the motion factor logit implies static behavior.
+        # We use sigmoid to bring the logit to a [0, 1] range for thresholding.
+        
+        is_static = active_anchors_factors[:, 0].abs() < self.cfg.static_anchor_threshold
+        
+        active_indices = torch.where(self.active_mask)[0]
+        static_indices = active_indices[is_static]
+        dynamic_indices = active_indices[~is_static]
+        
+        self.static_slots.fill_(False)
+        self.dynamic_slots.fill_(False)
+        
+        self.static_slots[static_indices] = True
+        self.dynamic_slots[dynamic_indices] = True
+        
+        # As a sanity check, ensure no overlap
+        assert not (self.static_slots & self.dynamic_slots).any()
+        # Ensure they are subsets of active mask
+        assert (self.static_slots & ~self.active_mask).sum() == 0
+        assert (self.dynamic_slots & ~self.active_mask).sum() == 0
+
+        print(f"Identified {static_indices.numel()} static slots and {dynamic_indices.numel()} dynamic slots.")
+
 
 def main(local_rank: int, world_rank, world_size: int, cfg: Config):
-    if world_size > 1 and not cfg.disable_viewer:
-        cfg.disable_viewer = True
-        if world_rank == 0:
-            print("Viewer is disabled in distributed training.")
+    """Master orchestrator for training on a long sequence."""
 
-    runner = Runner(local_rank, world_rank, world_size, cfg)
-
-    if cfg.ckpt is not None:
-        if not cfg.continue_training:
-            # run eval only
-            ckpts = [
-                torch.load(file, map_location=runner.device, weights_only=False)
-                for file in cfg.ckpt
-            ]
-            for k in runner.splats.keys():
-                runner.splats[k].data = torch.cat([ckpt["splats"][k] for ckpt in ckpts])
-            runner.decoders.load_state_dict(ckpts[0]["decoders"])
-            step = ckpts[0]["step"]
-            runner.cfg.compression_sim = ckpts[0]["compression_sim"]
-            if runner.cfg.compression_sim:
-                runner.load_entropy_model_from_ckpt(ckpts[0], cfg.entropy_model_type)
-            if cfg.knn:
-                _, runner.indices = find_k_neighbors(runner.splats["anchors"], cfg.n_knn)
-            
-            if cfg.export_ply:
-                runner.export_ply_sequence(step=step)
-                return
-
-            runner.eval(step=step)
-            runner.render_traj(step=step)
-            if cfg.compression is not None:
-                if cfg.compression == "end2end":
-                    assert ckpts[0]["compression_sim"]
-                    runner.run_compression(step=step)
-                else:
-                    print(f"Do not support {cfg.compression} now !")
-        else:
-            ckpts = [
-                torch.load(file, map_location=runner.device, weights_only=False)
-                for file in cfg.ckpt
-            ]
-            for k in runner.splats.keys():
-                runner.splats[k].data = torch.cat([ckpt["splats"][k] for ckpt in ckpts])
-            runner.decoders.load_state_dict(ckpts[0]["decoders"])
-            if runner.cfg.app_opt:
-                runner.app_module.load_state_dict(ckpts[0]["app_module"])
-            runner.train(init_step=7001)
-    else:
-        runner.train()
 
     if not cfg.disable_viewer:
-        print("Viewer running... Ctrl+C to exit.")
-        time.sleep(1000000)
+        print("Viewer is disabled for long sequence training.")
+        cfg.disable_viewer = True
+
+    runner = Runner(local_rank, world_rank, world_size, cfg)
+    
+    num_gops = (cfg.total_frames + cfg.GOP_size - 1) // cfg.GOP_size
+    print(f"Total frames: {cfg.total_frames}, GOP size: {cfg.GOP_size} -> Training for {num_gops} GOPs.")
+
+    for gop_idx in range(num_gops):
+        print(f"\n{'='*20} Starting GOP {gop_idx} {'='*20}")
+        
+        # --- 1. Prepare state if moving to a new GOP ---
+        if gop_idx > 0:
+            runner.prepare_for_next_gop()
+
+        # --- 2. Setup DataLoaders for the current GOP's frame window ---
+        start_frame = gop_idx * cfg.GOP_size
+        runner.cfg.start_frame = start_frame
+        
+        runner.trainset = Dataset(
+            runner.parser, split="train", patch_size=cfg.patch_size, load_depths=False,
+            test_set=cfg.test_set, remove_set=cfg.remove_set,
+            GOP_size=cfg.GOP_size, start_frame=start_frame
+        )
+        runner.valset = Dataset(
+            runner.parser, split="val", test_set=cfg.test_set, remove_set=cfg.remove_set,
+            GOP_size=cfg.GOP_size, start_frame=start_frame
+        )
+        
+        # --- 3. Train current GOP ---
+        runner.train(gop_index=gop_idx)
+        
+        # --- 4. Post-GOP analysis and state update ---
+        if gop_idx == 0:
+            runner.analyze_and_partition_anchors()
+
+        # --- 5. Save checkpoint for the next GOP (for recovery) ---
+        current_gop_ckpt_path = f"{runner.ckpt_dir}/gop_{gop_idx}_final.pt"
+        print(f"Saving final state for GOP {gop_idx} to {current_gop_ckpt_path}")
+        runner.save_gop_checkpoint(current_gop_ckpt_path)
+
+    print("\n--- Long sequence training complete! ---")
+
 
 def quaternion_to_rotation_matrix(quaternion):
     if quaternion.dim() == 1:
@@ -1796,7 +2041,7 @@ if __name__ == "__main__":
         "neur3d_0": (
             "neur3d dataset",
             Config(
-                strategy=GIFStreamStrategy(verbose=True,densify_grad_threshold=0.0005,deformation_gate=0.03),
+                strategy=StatefulGIFStreamStrategy(verbose=True,densify_grad_threshold=0.0005),
                 test_set=[0],
                 normalize_world_space=False,
                 anchor_feature_dim=24,
@@ -1808,7 +2053,7 @@ if __name__ == "__main__":
         "neur3d_1": (
             "neur3d dataset",
             Config(
-                strategy=GIFStreamStrategy(verbose=True,densify_grad_threshold=0.0006,deformation_gate=0.03),
+                strategy=StatefulGIFStreamStrategy(verbose=True,densify_grad_threshold=0.0006),
                 test_set=[0],
                 normalize_world_space=False,
                 anchor_feature_dim=48,
@@ -1819,7 +2064,7 @@ if __name__ == "__main__":
         "neur3d_2": (
             "neur3d dataset",
             Config(
-                strategy=GIFStreamStrategy(verbose=True,densify_grad_threshold=0.0006,deformation_gate=0.03),
+                strategy=StatefulGIFStreamStrategy(verbose=True,densify_grad_threshold=0.0006),
                 test_set=[0],
                 remove_set=[12],
                 normalize_world_space=False,
@@ -1836,7 +2081,7 @@ if __name__ == "__main__":
         "neur3d_full": (
             "neur3d dataset",
             Config(
-                strategy=GIFStreamStrategy(verbose=True,densify_grad_threshold=0.0005,deformation_gate=0.03),
+                strategy=StatefulGIFStreamStrategy(verbose=True,densify_grad_threshold=0.0005),
                 test_set=[0],
                 normalize_world_space=False,
                 anchor_feature_dim=36,
@@ -1844,7 +2089,8 @@ if __name__ == "__main__":
                 app_opt=False,
                 app_embed_dim=6,
                 knn=True,
-                data_factor=4,        
+                data_factor=4,
+                static_anchor_threshold=-1,
             ),
         ),
     }

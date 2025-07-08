@@ -204,8 +204,8 @@ def compress_scene(runner: Runner, resort_interval: int, static_threshold: float
     if runner.cfg.compression_sim:
         factors = runner.comp_sim_splats["factors"]
     else:
-        factors = torch.sigmoid(runner.splats["factors"])
-    
+        factors = runner.splats["factors"]
+
     time_factor = factors[:, 0]
     static_mask = torch.abs(time_factor) < static_threshold
     dynamic_mask = ~static_mask

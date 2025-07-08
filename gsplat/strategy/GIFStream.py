@@ -125,7 +125,7 @@ class GIFStreamStrategy(Strategy):
                 n_anchors = self._grow_gs(params, optimizers, state, step)
                 if self.verbose:
                     print(
-                        f"Now having {(params['anchors'].shape[0])} anchors."
+                        f"Now having {(params['anchors'].shape[0])} anchors. Densified {n_anchors} anchors."
                     )
                 torch.cuda.empty_cache()
 
@@ -349,9 +349,12 @@ class GIFStreamStrategy(Strategy):
         temp_anchor_demon = state["anchor_demon"][~prune_mask]
         state["anchor_demon"] = temp_anchor_demon
 
+        num_pruned = prune_mask.sum().item()
         if prune_mask.shape[0]>0:
             self.prune_anchors(params,optimizers,~prune_mask)
-        new_anchors_count -= prune_mask.view((-1)).nonzero(as_tuple=False).shape[0]
+            if self.verbose:
+                print(f"Pruned {num_pruned} anchors")
+        new_anchors_count -= num_pruned
 
         return new_anchors_count
     
@@ -379,7 +382,10 @@ class GIFStreamStrategy(Strategy):
         state["anchor_demon"] = temp_anchor_demon
 
         if prune_mask.shape[0]>0:
+            num_pruned = prune_mask.sum().item()
             self.prune_anchors(params,optimizers,~prune_mask)
+            if self.verbose:
+                print(f"Pruned {num_pruned} anchors")
     
     @torch.no_grad()
     def grow_anchors(
