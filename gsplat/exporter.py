@@ -366,7 +366,7 @@ def splat2ply_bytes(
     quats: torch.Tensor,
     opacities: torch.Tensor,
     sh0: torch.Tensor,
-    shN: torch.Tensor,
+    shN: torch.Tensor | None = None,
 ) -> bytes:
     """Return the binary Ply file. Supported by almost all viewers.
 
@@ -394,8 +394,9 @@ def splat2ply_bytes(
     buffer.write(b"property float z\n")
     for i, data in enumerate([sh0, shN]):
         prefix = "f_dc" if i == 0 else "f_rest"
-        for j in range(data.shape[1]):
-            buffer.write(f"property float {prefix}_{j}\n".encode())
+        if data is not None:
+            for j in range(data.shape[1]):
+                buffer.write(f"property float {prefix}_{j}\n".encode())
     buffer.write(b"property float opacity\n")
     for i in range(scales.shape[1]):
         buffer.write(f"property float scale_{i}\n".encode())
@@ -404,9 +405,14 @@ def splat2ply_bytes(
     buffer.write(b"end_header\n")
 
     # Concatenate all tensors in the correct order
-    splat_data = torch.cat(
-        [means, sh0, shN, opacities.unsqueeze(1), scales, quats], dim=1
-    )
+    if shN is not None:
+        splat_data = torch.cat(
+            [means, sh0, shN, opacities.unsqueeze(1), scales, quats], dim=1
+        )
+    else:
+        splat_data = torch.cat(
+            [means, sh0, opacities.unsqueeze(1), scales, quats], dim=1
+        )
     # Ensure correct dtype
     splat_data = splat_data.to(torch.float32)
 
@@ -478,7 +484,7 @@ def export_splats(
     quats: torch.Tensor,
     opacities: torch.Tensor,
     sh0: torch.Tensor,
-    shN: torch.Tensor,
+    shN: torch.Tensor | None = None,
     format: Literal["ply", "splat", "ply_compressed"] = "ply",
     save_to: Optional[str] = None,
 ) -> bytes:
@@ -504,18 +510,21 @@ def export_splats(
     assert quats.shape == (total_splats, 4), "Quaternions must be of shape (N, 4)"
     assert opacities.shape == (total_splats,), "Opacities must be of shape (N,)"
     assert sh0.shape == (total_splats, 1, 3), "sh0 must be of shape (N, 1, 3)"
-    assert (
+    if shN is not None:
+        assert (
         shN.ndim == 3 and shN.shape[0] == total_splats and shN.shape[2] == 3
     ), f"shN must be of shape (N, K, 3), got {shN.shape}"
 
     # Reshape spherical harmonics
     sh0 = sh0.squeeze(1)  # Shape (N, 3)
-    shN = shN.permute(0, 2, 1).reshape(means.shape[0], -1)  # Shape (N, K * 3)
+    if shN is not None:
+        shN = shN.permute(0, 2, 1).reshape(means.shape[0], -1)  # Shape (N, K * 3)
 
     # Check for NaN or Inf values
-    invalid_mask = (
-        torch.isnan(means).any(dim=1)
-        | torch.isinf(means).any(dim=1)
+    if shN is not None:
+        invalid_mask = (
+            torch.isnan(means).any(dim=1)
+            | torch.isinf(means).any(dim=1)
         | torch.isnan(scales).any(dim=1)
         | torch.isinf(scales).any(dim=1)
         | torch.isnan(quats).any(dim=1)
@@ -526,7 +535,20 @@ def export_splats(
         | torch.isinf(sh0).any(dim=1)
         | torch.isnan(shN).any(dim=1)
         | torch.isinf(shN).any(dim=1)
-    )
+        )
+    else:
+        invalid_mask = (
+            torch.isnan(means).any(dim=1)
+            | torch.isinf(means).any(dim=1)
+            | torch.isnan(scales).any(dim=1)
+            | torch.isinf(scales).any(dim=1)
+            | torch.isnan(quats).any(dim=1)
+            | torch.isinf(quats).any(dim=1)
+            | torch.isnan(opacities).any(dim=0)
+            | torch.isinf(opacities).any(dim=0)
+            | torch.isnan(sh0).any(dim=1)
+            | torch.isinf(sh0).any(dim=1)
+        )
 
     # Filter out invalid entries
     valid_mask = ~invalid_mask
@@ -535,7 +557,8 @@ def export_splats(
     quats = quats[valid_mask]
     opacities = opacities[valid_mask]
     sh0 = sh0[valid_mask]
-    shN = shN[valid_mask]
+    if shN is not None:
+        shN = shN[valid_mask]
 
     if format == "ply":
         data = splat2ply_bytes(means, scales, quats, opacities, sh0, shN)

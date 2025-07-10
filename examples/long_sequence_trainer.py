@@ -1885,6 +1885,8 @@ class Runner:
             if name in ckpt["net_optimizers"]:
                 opt.load_state_dict(ckpt["net_optimizers"][name])
         
+        if self.cfg.knn:
+            _, self.indices = find_k_neighbors(self.splats["anchors"], self.cfg.n_knn)
         self.active_mask = ckpt["active_mask"].to(self.device)
         self.static_slots = ckpt["static_slots"].to(self.device)
         self.dynamic_slots = ckpt["dynamic_slots"].to(self.device)
@@ -2084,12 +2086,12 @@ if __name__ == "__main__":
                 strategy=StatefulGIFStreamStrategy(verbose=True,densify_grad_threshold=0.0005),
                 test_set=[0],
                 normalize_world_space=False,
-                anchor_feature_dim=36,
-                c_perframe = 8,
+                anchor_feature_dim=24,
+                c_perframe = 4,
                 app_opt=False,
                 app_embed_dim=6,
                 knn=True,
-                data_factor=4,
+                data_factor=1,
                 static_anchor_threshold=-1,
             ),
         ),
