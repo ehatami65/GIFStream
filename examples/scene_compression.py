@@ -545,7 +545,7 @@ def main():
     parser.add_argument(
         "--static_threshold",
         type=float,
-        default=1e-2,
+        default=-1,
         help="Threshold for considering an anchor as static based on its time factor.",
     )
     parser.add_argument("--device", default="cuda:0", help="Device to use (e.g., cuda:0).")
