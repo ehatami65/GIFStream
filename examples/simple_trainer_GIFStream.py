@@ -81,6 +81,8 @@ class Config:
     ckpt: Optional[List[str]] = None
     # Export the scene as a sequence of .ply files
     export_ply: bool = False
+    # render trajectory 
+    render_traj: bool = False
     # Name of compression strategy to use
     compression: Optional[Literal["end2end", "2dcodec"]] = None
     # Quantization parameters when set to hevc
@@ -1277,8 +1279,11 @@ class Runner:
                 # eval the full set
                 if step in [i - 1 for i in cfg.eval_steps]:
                     self.eval(step)
-                    self.render_traj(step)
-                    self.export_ply_sequence(step)
+                    
+                    if self.cfg.render_traj:
+                        self.render_traj(step)
+                    if self.cfg.export_ply: 
+                        self.export_ply_sequence(step)
 
                 # run compression
                 if cfg.compression is not None and step in [i - 1 for i in cfg.eval_steps]:
@@ -1301,6 +1306,11 @@ class Runner:
     def eval(self, step: int, stage: str = "val"):
         """Entry for evaluation."""
         print("Running evaluation...")
+
+        if len(self.valset) == 0:
+            print("Validation set is empty, skipping evaluation.")
+            return
+
         training_state = self.istraining
         self.istraining = False
         cfg = self.cfg
@@ -1836,13 +1846,13 @@ if __name__ == "__main__":
         "neur3d_full": (
             "neur3d dataset",
             Config(
-                strategy=GIFStreamStrategy(verbose=True,densify_grad_threshold=0.0005,deformation_gate=0.03),
-                test_set=[0],
+                strategy=GIFStreamStrategy(verbose=True,densify_grad_threshold=0.0006,deformation_gate=0.03),
+                test_set=[],
+                remove_set=[],
                 normalize_world_space=False,
-                anchor_feature_dim=24,
-                c_perframe = 4,
+                anchor_feature_dim=48,
+                c_perframe = 8,
                 app_opt=False,
-                app_embed_dim=6,
             ),
         ),
     }

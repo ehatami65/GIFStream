@@ -11,6 +11,7 @@ import json
 import glob
 from collections import defaultdict
 import math
+import re
 
 # Use the simple trainer's Runner and Config
 from simple_trainer_GIFStream import Runner, Config, quaternion_to_rotation_matrix, quaternion_multiply
@@ -90,7 +91,7 @@ def get_gaussians_for_frame(runner: Runner, time_val: float):
     }, primitive_activity_mask
 
 
-def write_output(output_dir: str, crf: int, video_buffers: dict, full_meta: dict):
+def write_output(output_dir: str, video_buffers: dict, full_meta: dict):
     """Writes compressed video buffers and metadata to files."""
     video_format = full_meta.get("video_format", "mp4")
     print(f"--- Writing output files (format: {video_format}) ---")
@@ -121,8 +122,7 @@ def write_output(output_dir: str, crf: int, video_buffers: dict, full_meta: dict
             ffmpeg_params = ['-loglevel', 'quiet']
             if codec in ['libx265', 'libx264']:
                 ffmpeg_params, x265_opts = ['-loglevel', 'quiet'], ['log-level=none']
-                if crf == 0: x265_opts.append('lossless=1')
-                else: ffmpeg_params.extend(['-crf', str(crf)])
+                x265_opts.append('lossless=1')
                 ffmpeg_params.extend(['-x265-params', ':'.join(x265_opts)])
             
             imageio.mimwrite(
@@ -297,11 +297,10 @@ def main():
     parser.add_argument("--checkpoints_dir", help="Path to the directory containing GOP checkpoints (for compression modes).")
     parser.add_argument("--config_path", help="Path to the original config.yml file (for compression modes).")
     parser.add_argument("--output_dir", default="./unified_compression_output", help="Directory for compressed/decompressed files.")
-    parser.add_argument("--crf", type=int, default=0, help="CRF for video compression. Lower is higher quality. 0 is lossless for some codecs.")
     parser.add_argument("--device", default="cuda:0", help="Device to use.")
     parser.add_argument("--video_format", type=str, default='mp4', choices=['mp4', 'webp'], help="Format for saving dynamic data streams.")
     parser.add_argument("--mp4_pixel_format", type=str, default='rgb24', choices=['yuv420p', 'yuv444p', 'rgb24', 'gbrp'], help="Pixel format for MP4 encoding.")
-    parser.add_argument("--codec", type=str, default='libx265', choices=['libx265', 'ffv1', 'libx264'], help="Video codec for MP4 encoding.")
+    parser.add_argument("--codec", type=str, default='libx265', choices=['libx265', 'libx264'], help="Video codec for MP4 encoding.")
     args = parser.parse_args()
 
     if args.mode == 'compress':
@@ -311,9 +310,14 @@ def main():
         os.makedirs(args.output_dir, exist_ok=True)
         device = args.device
         
-        gop_checkpoints = sorted(glob.glob(os.path.join(args.checkpoints_dir, "ckpt_*.pt")))
+        def gop_sort_key(s):
+            # Extracts number from filename for sorting, e.g., GOP_10.pt -> 10
+            match = re.search(r'(\d+)', os.path.basename(s))
+            return int(match.group(1)) if match else -1
+
+        gop_checkpoints = sorted(glob.glob(os.path.join(args.checkpoints_dir, "ckpt_*.pt")), key=gop_sort_key)
         if not gop_checkpoints:
-            gop_checkpoints = sorted(glob.glob(os.path.join(args.checkpoints_dir, "*.pt"))) # Fallback for different naming
+            gop_checkpoints = sorted(glob.glob(os.path.join(args.checkpoints_dir, "*.pt")), key=gop_sort_key) # Fallback for different naming
         
         if not gop_checkpoints:
             raise FileNotFoundError(f"No GOP checkpoints found in {args.checkpoints_dir}")
@@ -321,7 +325,7 @@ def main():
         print("--- Initializing Runner from Config ---")
         with open(args.config_path, 'r') as f:
             # Use safe_load, assuming the config is a simple structure
-            trainer_config_dict = yaml.safe_load(f)
+            trainer_config_dict = yaml.unsafe_load(f)
 
         cfg = Config()
         for key, value in trainer_config_dict.items():
@@ -479,7 +483,7 @@ def main():
             "codec": args.codec,
             "mp4_pixel_format": args.mp4_pixel_format,
         }
-        write_output(args.output_dir, args.crf, video_buffers, full_meta)
+        write_output(args.output_dir, video_buffers, full_meta)
 
     elif args.mode == 'decompress':
         decompress_and_export(args.output_dir, args.device)
