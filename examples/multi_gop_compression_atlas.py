@@ -12,6 +12,7 @@ import glob
 from collections import defaultdict
 import math
 import re
+import subprocess
 
 # Use the simple trainer's Runner and Config
 from simple_trainer_GIFStream import Runner, Config, quaternion_to_rotation_matrix
@@ -21,11 +22,13 @@ from utils import find_k_neighbors
 
 
 @torch.no_grad()
-def get_gaussians_for_frame(runner: Runner, time_val: float):
+def get_gaussians_for_frame(runner: Runner, time_val: float, previous_gaussians: dict = None):
     """
     Computes and returns the neural Gaussians for a specific time frame.
     Also returns a primitive-level activity mask.
-    This is adapted from scene_compression.py and the simple_trainer's export logic.
+    If previous_gaussians is provided, values for inactive primitives are
+    carried forward from previous_gaussians. If not provided, inactive
+    primitives are filled with the median value for that parameter.
     """
     cfg = runner.cfg
     device = runner.device
@@ -59,7 +62,7 @@ def get_gaussians_for_frame(runner: Runner, time_val: float):
     selected_scales = results["selected_scales"]
 
     # This is the key mask: True for any primitive that should be rendered.
-    primitive_activity_mask = (neural_opacity >= 0.0).view(-1)
+    primitive_activity_mask = (neural_opacity > 0.0).view(-1)
     
     anchor_offset = motion[:, -7:-4]
     moved_anchors = selected_anchors + anchor_offset
@@ -76,73 +79,176 @@ def get_gaussians_for_frame(runner: Runner, time_val: float):
     anchors_repeated = moved_anchors.unsqueeze(1).repeat(1, cfg.n_offsets, 1).view(-1, 3)
 
     scales = scales_repeated[:, 3:] * torch.sigmoid(neural_scale_rot[:, :3])
+    scales = torch.log(scales.clamp(min=1e-8))
     quats = F.normalize(neural_scale_rot[:, 3:7])
     means = anchors_repeated + transformed_offsets
-    opacities = neural_opacity.squeeze(-1)
+    opacities = torch.logit(neural_opacity.squeeze(-1).clamp(min=0.0, max=1.0)).clamp(min=-6, max=12.0)
     
-    colors = neural_colors
-    sh0 = rgb2sh(colors).unsqueeze(1)
+    sh0 = neural_colors.unsqueeze(1)
     # For now, we only handle degree 0 SH.
     shN = torch.zeros((sh0.shape[0], 0, 3), device=device)
 
-    return {
-        "means": means, "scales": torch.log(scales.clamp(min=1e-10)), "quats": quats,
-        "opacities": opacities, "sh0": sh0, "shN": shN,
-    }, primitive_activity_mask
+    current = {
+        "means": means,
+        "scales": scales,
+        "quats": quats,
+        "opacities": opacities,
+        "sh0": sh0,
+        "shN": shN,
+    }
+
+    inactive_mask = ~primitive_activity_mask
+    if previous_gaussians is not None:
+        # Carry forward previous values for inactive primitives
+        for key, tensor in current.items():
+            prev_tensor = previous_gaussians[key]
+            tensor[inactive_mask] = prev_tensor[inactive_mask]
+    else:
+        # Fill inactive primitives with median per-parameter value
+        if inactive_mask.any():
+            active_mask = primitive_activity_mask
+            # If no active primitives, compute median over all
+            def median_over_first_dim(t: torch.Tensor, use_active: bool):
+                src = t[active_mask] if use_active and active_mask.any() else t
+                if src.ndim == 1:
+                    return src.median()
+                else:
+                    return src.median(dim=0).values
+
+            # means, scales: shape (N, D)
+            for key in ["means", "scales"]:
+                med = median_over_first_dim(current[key], use_active=True)
+                current[key][inactive_mask] = med
+
+            # quats: median then renormalize
+            quat_med = median_over_first_dim(current["quats"], use_active=True)
+            quat_med = F.normalize(quat_med.unsqueeze(0), dim=-1).squeeze(0)
+            current["quats"][inactive_mask] = quat_med
+
+            # sh0: shape (N,1,3); take median over first dim → (1,3)
+            sh0_med = median_over_first_dim(current["sh0"], use_active=True)
+            current["sh0"][inactive_mask] = sh0_med
+
+            # opacities: shape (N,)
+            opa_med = median_over_first_dim(current["opacities"], use_active=True)
+            current["opacities"][inactive_mask] = opa_med
+
+    return current, primitive_activity_mask
 
 
 def write_output(output_dir: str, video_buffers: dict, full_meta: dict):
     """Writes compressed video buffers and metadata to files."""
-    video_format = full_meta.get("video_format", "mp4")
-    print(f"--- Writing output files (format: {video_format}) ---")
+    codec = "libx265"
+    mp4_pixel_format = "rgb24"
+    extension = "mp4"
+
+    print(f"--- Writing output files (format: {extension}) ---")
     total_bytes = 0
 
     for name, frames in video_buffers.items():
         if not frames: continue
         
-        codec = full_meta.get("codec", "libx265")
-
-        # Determine the file extension based on format/codec
-        extension = video_format
-        if video_format == 'mp4' and codec == 'ffv1':
-            extension = 'mkv'
-
         output_path = os.path.join(output_dir, f"{name}_dynamic.{extension}")
+        print(f"  > Encoding {name} with codec: {codec}, pixel format: {mp4_pixel_format}, container: {extension}")
 
-        if video_format == 'mp4':
-            mp4_pixel_format = full_meta.get("mp4_pixel_format", "yuv420p")
-            print(f"  > Encoding {name} with codec: {codec}, pixel format: {mp4_pixel_format}, container: {extension}")
-            
-            h, w = frames[0].shape[:2]
-            pad_h, pad_w = (2 - h % 2) % 2, (2 - w % 2) % 2
-            frames_to_write = [np.pad(f, ((0, pad_h), (0, pad_w), (0,0)) if f.ndim==3 else ((0, pad_h), (0, pad_w)), 'constant') for f in frames]
-            
-            pixelformat = mp4_pixel_format if frames[0].ndim == 3 else 'gray8'
-            
-            ffmpeg_params = ['-loglevel', 'quiet']
-            if codec in ['libx265', 'libx264']:
-                ffmpeg_params, x265_opts = ['-loglevel', 'quiet'], ['log-level=none']
-                x265_opts.append('lossless=1')
-                ffmpeg_params.extend(['-x265-params', ':'.join(x265_opts)])
-            
-            imageio.mimwrite(
-                output_path, frames_to_write, codec=codec,
-                ffmpeg_params=ffmpeg_params,
-                pixelformat=pixelformat, macro_block_size=1
-            )
-        elif video_format == 'webp':
-            imageio.mimwrite(output_path, frames, format='WEBP', lossless=True)
+        h, w = frames[0].shape[:2]
+        pad_h, pad_w = (2 - h % 2) % 2, (2 - w % 2) % 2
+        
+        is_rgb = frames[0].ndim == 3
+        input_pix_fmt = 'rgb24' if is_rgb else 'gray8'
+        # For libx265, gbrp (planar RGB) is required for lossless RGB output.
+        # 'gray' is already planar and works directly.
+        output_pix_fmt = 'gbrp' if is_rgb else 'gray'
+        
+        command = [
+            './ffmpeg/bin/ffmpeg',
+            '-y',  # Overwrite output file if it exists
+            # Input options: describe the raw video stream from the pipe
+            '-f', 'rawvideo',
+            '-s', f'{w+pad_w}x{h+pad_h}',
+            '-pix_fmt', input_pix_fmt,
+            '-r', '10',  # Frame rate
+            '-i', '-',  # Input from stdin
+            # Output options: define the encoding
+            '-c:v', codec,
+            '-preset', 'medium',
+            '-x265-params', 'lossless=1',
+            '-pix_fmt', output_pix_fmt,
+            output_path
+        ]
+
+        proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        for frame in frames:
+            padded_frame = np.pad(frame, ((0, pad_h), (0, pad_w), (0,0)) if frame.ndim == 3 else ((0, pad_h), (0, pad_w)), 'constant')
+            proc.stdin.write(padded_frame.tobytes())
+        
+        stdout, stderr = proc.communicate()
+        if proc.returncode != 0:
+            print(f"Error encoding {name}: {stderr.decode('utf-8')}")
 
         if os.path.exists(output_path):
             total_bytes += os.path.getsize(output_path)
-
-    full_meta["video_format"] = video_format
+    
+    full_meta["video_format"] = extension
     meta_path = os.path.join(output_dir, "meta_bundle.json")
     with open(meta_path, "w") as f:
         json.dump(full_meta, f, indent=2)
     total_bytes += os.path.getsize(meta_path)
     
     print(f"Total compressed size: {total_bytes / 1e6:.2f} MB")
+
+
+def write_atlas_output(output_dir: str, atlas_frames: list, full_meta: dict, atlas_name: str = "atlas_dynamic"):
+    """
+    Writes a single atlas video and metadata bundle.
+    Atlas frames must be HxWx3 uint8.
+    """
+    codec = "libx265"
+    extension = "mp4"
+
+    output_path = os.path.join(output_dir, f"{atlas_name}.{extension}")
+
+    h, w = atlas_frames[0].shape[:2]
+    pad_h, pad_w = (2 - h % 2) % 2, (2 - w % 2) % 2
+    
+    command = [
+        './ffmpeg/bin/ffmpeg',
+        '-y',
+        # Input options
+        '-f', 'rawvideo',
+        '-s', f'{w+pad_w}x{h+pad_h}',
+        '-pix_fmt', 'rgb24',
+        '-r', '10',
+        '-i', '-',
+        # Output options
+        '-c:v', codec,
+        '-preset', 'slow',
+        '-x265-params', 'lossless=1',
+        '-pix_fmt', 'gbrp',
+        output_path
+    ]
+
+    proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    for frame in atlas_frames:
+        padded_frame = np.pad(frame, ((0, pad_h), (0, pad_w), (0,0)), 'constant')
+        proc.stdin.write(padded_frame.tobytes())
+    
+    stdout, stderr = proc.communicate()
+    if proc.returncode != 0:
+        print(f"Error encoding atlas: {stderr.decode('utf-8')}")
+
+    # Write metadata
+    meta_path = os.path.join(output_dir, "meta_bundle.json")
+    with open(meta_path, "w") as f:
+        json.dump(full_meta, f, indent=2)
+
+    size_bytes = 0
+    if os.path.exists(output_path):
+        size_bytes += os.path.getsize(output_path)
+    if os.path.exists(meta_path):
+        size_bytes += os.path.getsize(meta_path)
+    print(f"Total compressed size: {size_bytes / 1e6:.2f} MB")
+
 
 def decompress_and_export(output_dir: str, device: str):
     """
@@ -166,31 +272,60 @@ def decompress_and_export(output_dir: str, device: str):
     # 1. Load the unified dynamic video streams
     video_data = defaultdict(list)
     total_frames = full_meta.get("total_frames", 0)
-    video_format = full_meta.get("video_format", "mp4")
-    codec = full_meta.get("codec", "libx265")
+    video_format = "mp4"
+    codec = "libx265"
+    extension = "mp4"
 
-    if total_frames > 0:
-        print(f"  Loading video streams (format: {video_format}, codec: {codec})...")
-        # Infer parameter names from the first frame's metadata
-        param_names = set(full_meta["frames_meta"]["0"].keys()) | {"activity_mask"}
-        
-        extension = video_format
-        if video_format == 'mp4' and codec == 'ffv1':
-            extension = 'mkv'
+    # Atlas-aware path
+    atlas_meta = full_meta.get("atlas", None)
+    if total_frames > 0 and atlas_meta and atlas_meta.get("enabled", False):
+        print(f"  Loading atlas video (format: {video_format}, codec: {codec})...")
+        atlas_path = os.path.join(output_dir, f"atlas_dynamic.{extension}")
+        if not os.path.exists(atlas_path):
+            raise FileNotFoundError(f"Atlas video not found at {atlas_path}")
+        atlas_frames = imageio.mimread(atlas_path, memtest=False)
 
-        for param_name in param_names:
-            if param_name == "quats":
-                for component in ['x', 'y', 'z', 'w']:
-                    video_path = os.path.join(output_dir, f"quats_{component}_dynamic.{extension}")
-                    if os.path.exists(video_path): video_data[f"quats_{component}"] = imageio.mimread(video_path, memtest=False)
-            else:
-                for suffix in ["", "_l", "_u"]:
-                    video_path = os.path.join(output_dir, f"{param_name}{suffix}_dynamic.{extension}")
-                    if os.path.exists(video_path): video_data[f"{param_name}{suffix}"] = imageio.mimread(video_path, memtest=False)
+        grid_cols = atlas_meta["grid_cols"]
+        grid_rows = atlas_meta["grid_rows"]
+        tile_size = atlas_meta["tile_size"]
+        buffer_specs = atlas_meta["buffer_specs"]  # list of {name, channels}
+
+        # Pre-create containers
+        for spec in buffer_specs:
+            video_data[spec["name"]] = []
+
+        for frame in atlas_frames:
+            for idx, spec in enumerate(buffer_specs):
+                row = idx // grid_cols
+                col = idx % grid_cols
+                y0, y1 = row * tile_size, (row + 1) * tile_size
+                x0, x1 = col * tile_size, (col + 1) * tile_size
+                tile = frame[y0:y1, x0:x1]
+                if spec.get("channels", 3) == 1:
+                    # Convert to single channel
+                    gray = tile[..., 0]
+                    video_data[spec["name"]].append(gray)
+                else:
+                    video_data[spec["name"]].append(tile)
+    else:
+        if total_frames > 0:
+            print(f"  Loading video streams (format: {video_format}, codec: {codec})...")
+            # Infer parameter names from the first frame's metadata
+            param_names = set(full_meta["frames_meta"]["0"].keys()) | {"activity_mask"}
             
-        activity_path = os.path.join(output_dir, f"activity_mask_dynamic.{extension}")
-        if os.path.exists(activity_path):
-            video_data["activity_mask"] = imageio.mimread(activity_path, memtest=False)
+            for param_name in param_names:
+                if param_name == "quats":
+                    for component in ['x', 'y', 'z', 'w']:
+                        video_path = os.path.join(output_dir, f"quats_{component}_dynamic.{extension}")
+                        if os.path.exists(video_path): video_data[f"quats_{component}"] = imageio.mimread(video_path, memtest=False)
+                else:
+                    for suffix in ["", "_l", "_u"]:
+                        video_path = os.path.join(output_dir, f"{param_name}{suffix}_dynamic.{extension}")
+                        if os.path.exists(video_path): video_data[f"{param_name}{suffix}"] = imageio.mimread(video_path, memtest=False)
+            
+            activity_path = os.path.join(output_dir, f"activity_mask_dynamic.{extension}")
+            if os.path.exists(activity_path):
+                video_data["activity_mask"] = imageio.mimread(activity_path, memtest=False)
 
     # 2. Decompress and combine frame-by-frame
     for frame_idx in tqdm(range(total_frames), desc="Exporting PLY frames"):
@@ -253,6 +388,10 @@ def decompress_and_export(output_dir: str, device: str):
                         continue
 
                     filtered_tensor = tensor[activity_mask_padded]
+                    if key == "sh0":
+                        filtered_tensor = rgb2sh(filtered_tensor)
+                    elif key == "opacities":
+                        filtered_tensor = torch.sigmoid(filtered_tensor)
                     final_splats[key] = filtered_tensor
 
         if final_splats.get("means") is not None and final_splats["means"].shape[0] > 0:
@@ -298,9 +437,8 @@ def main():
     parser.add_argument("--config_path", help="Path to the original config.yml file (for compression modes).")
     parser.add_argument("--output_dir", default="./unified_compression_output", help="Directory for compressed/decompressed files.")
     parser.add_argument("--device", default="cuda:0", help="Device to use.")
-    parser.add_argument("--video_format", type=str, default='mp4', choices=['mp4', 'webp'], help="Format for saving dynamic data streams.")
-    parser.add_argument("--mp4_pixel_format", type=str, default='rgb24', choices=['yuv420p', 'yuv444p', 'rgb24', 'gbrp'], help="Pixel format for MP4 encoding.")
-    parser.add_argument("--codec", type=str, default='libx265', choices=['libx265', 'libx264'], help="Video codec for MP4 encoding.")
+    parser.add_argument("--use_atlas", action='store_true', help="If set, combine all streams into a single video atlas.")
+    parser.add_argument("--atlas_cols", type=int, default=0, help="Number of columns in atlas grid (0=auto sqrt).")
     args = parser.parse_args()
 
     if args.mode == 'compress':
@@ -347,10 +485,16 @@ def main():
             # a. Cache raw frame data for this GOP
             gop_raw_frames = []
             gop_size = runner.cfg.GOP_size
+            previous_gaussians_full = None
             for frame_in_gop in range(gop_size):
                 time_val = frame_in_gop / (gop_size - 1) if gop_size > 1 else 0
-                gaussians, activity_mask = get_gaussians_for_frame(runner, time_val)
+                is_first = (frame_in_gop == 0)
+                gaussians, activity_mask = get_gaussians_for_frame(
+                    runner, time_val, previous_gaussians=previous_gaussians_full
+                )
                 gop_raw_frames.append({"gaussians": gaussians, "activity_mask": activity_mask})
+                # Update previous for next frame in GOP
+                previous_gaussians_full = {k: v.clone() for k, v in gaussians.items()}
             
             # b. Compute GOP-wide activity mask
             if not gop_raw_frames: continue
@@ -409,11 +553,16 @@ def main():
             
             processed_gops_data.append({'sidelen': n_sidelen_gop, 'frames': gop_processed_frames})
 
-        # --- Pass 2: Unify Frame Size and Encode Video ---
+        # --- Pass 2: Unify frame size and Encode Video ---
         print("\n--- Pass 2: Unifying frame sizes and preparing video buffers ---")
         
         if not processed_gops_data:
             print("No data processed. Exiting.")
+            return
+
+        first_gop_with_frames = next((gop for gop in processed_gops_data if gop['frames']), None)
+        if not first_gop_with_frames:
+            print("No frames with data found across all GOPs. Exiting.")
             return
             
         max_sidelen = max(gop['sidelen'] for gop in processed_gops_data)
@@ -423,11 +572,17 @@ def main():
         final_frames_meta = {}
         
         # Determine all possible buffer names from the first processed frame
-        all_possible_buffer_names = set(processed_gops_data[0]['frames'][0]['arrays'].keys())
+        all_possible_buffer_names_set = set(first_gop_with_frames['frames'][0]['arrays'].keys())
         # Manually add separated quat buffers if the combined one exists
-        if "quats" in all_possible_buffer_names:
-            all_possible_buffer_names.remove("quats")
-            for i in ['x', 'y', 'z', 'w']: all_possible_buffer_names.add(f"quats_{i}")
+        if "quats" in all_possible_buffer_names_set:
+            all_possible_buffer_names_set.remove("quats")
+            for i in ['x', 'y', 'z', 'w']: all_possible_buffer_names_set.add(f"quats_{i}")
+
+        # Sort buffer names to ensure a consistent order, with means_l first.
+        all_possible_buffer_names = sorted(list(all_possible_buffer_names_set))
+        if 'means_l' in all_possible_buffer_names:
+            all_possible_buffer_names.remove('means_l')
+            all_possible_buffer_names.insert(0, 'means_l')
 
 
         global_frame_idx = 0
@@ -479,11 +634,53 @@ def main():
             "frames_meta": final_frames_meta,
             "max_sidelen": max_sidelen,
             "total_frames": global_frame_idx,
-            "video_format": args.video_format,
-            "codec": args.codec,
-            "mp4_pixel_format": args.mp4_pixel_format,
+            "video_format": "mp4",
+            "codec": "libx265",
+            "mp4_pixel_format": "rgb24",
         }
-        write_output(args.output_dir, video_buffers, full_meta)
+
+        if args.use_atlas:
+            # Build atlas: determine order and channel specs
+            buffer_specs = []
+            for name in all_possible_buffer_names:
+                if name not in video_buffers: continue
+                first_frame = video_buffers[name][0]
+                channels = 3 if first_frame.ndim == 3 else 1
+                buffer_specs.append({"name": name, "channels": channels})
+
+            n_tiles = len(buffer_specs)
+            grid_cols = args.atlas_cols if args.atlas_cols and args.atlas_cols > 0 else int(math.ceil(math.sqrt(n_tiles)))
+            grid_rows = int(math.ceil(n_tiles / grid_cols))
+
+            atlas_h = grid_rows * max_sidelen
+            atlas_w = grid_cols * max_sidelen
+
+            atlas_frames = []
+            for f_idx in range(global_frame_idx):
+                atlas = np.zeros((atlas_h, atlas_w, 3), dtype=np.uint8)
+                for idx, spec in enumerate(buffer_specs):
+                    row = idx // grid_cols
+                    col = idx % grid_cols
+                    y0, y1 = row * max_sidelen, (row + 1) * max_sidelen
+                    x0, x1 = col * max_sidelen, (col + 1) * max_sidelen
+                    tile = video_buffers[spec["name"]][f_idx]
+                    if tile.ndim == 2:
+                        tile_rgb = np.stack([tile, tile, tile], axis=-1)
+                    else:
+                        tile_rgb = tile
+                    atlas[y0:y1, x0:x1] = tile_rgb
+                atlas_frames.append(atlas)
+
+            full_meta["atlas"] = {
+                "enabled": True,
+                "grid_cols": grid_cols,
+                "grid_rows": grid_rows,
+                "tile_size": max_sidelen,
+                "buffer_specs": buffer_specs,
+            }
+            write_atlas_output(args.output_dir, atlas_frames, full_meta)
+        else:
+            write_output(args.output_dir, video_buffers, full_meta)
 
     elif args.mode == 'decompress':
         decompress_and_export(args.output_dir, args.device)
