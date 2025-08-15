@@ -103,35 +103,6 @@ def get_gaussians_for_frame(runner: Runner, time_val: float, previous_gaussians:
         for key, tensor in current.items():
             prev_tensor = previous_gaussians[key]
             tensor[inactive_mask] = prev_tensor[inactive_mask]
-    else:
-        # Fill inactive primitives with median per-parameter value
-        if inactive_mask.any():
-            active_mask = primitive_activity_mask
-            # If no active primitives, compute median over all
-            def median_over_first_dim(t: torch.Tensor, use_active: bool):
-                src = t[active_mask] if use_active and active_mask.any() else t
-                if src.ndim == 1:
-                    return src.median()
-                else:
-                    return src.median(dim=0).values
-
-            # means, scales: shape (N, D)
-            for key in ["means", "scales"]:
-                med = median_over_first_dim(current[key], use_active=True)
-                current[key][inactive_mask] = med
-
-            # quats: median then renormalize
-            quat_med = median_over_first_dim(current["quats"], use_active=True)
-            quat_med = F.normalize(quat_med.unsqueeze(0), dim=-1).squeeze(0)
-            current["quats"][inactive_mask] = quat_med
-
-            # sh0: shape (N,1,3); take median over first dim → (1,3)
-            sh0_med = median_over_first_dim(current["sh0"], use_active=True)
-            current["sh0"][inactive_mask] = sh0_med
-
-            # opacities: shape (N,)
-            opa_med = median_over_first_dim(current["opacities"], use_active=True)
-            current["opacities"][inactive_mask] = opa_med
 
     return current, primitive_activity_mask
 
@@ -360,7 +331,22 @@ def decompress_and_export(output_dir: str, device: str):
                     frame = frame[:max_sidelen, :max_sidelen]
                 frame_compressed_arrays[param_name] = frame
 
+        # Decompress all parameters at once. The main `decompress` function handles everything.
         decompressed_padded_splats = compressor.decompress(frame_meta, frame_compressed_arrays, device=device)
+
+        # Check if we are using the new delta format
+        if "means_delta" in decompressed_padded_splats:
+            # 'means' contains the average_means (returned in LINEAR space)
+            average_means = decompressed_padded_splats["means"]
+            
+            # 'means_delta' contains the delta (also in LINEAR space)
+            delta = decompressed_padded_splats["means_delta"]
+            
+            # Reconstruct the final means with a simple addition
+            decompressed_padded_splats["means"] = average_means + delta
+            
+            # Clean up the temporary delta key from the dictionary
+            del decompressed_padded_splats["means_delta"]
         
         # Now, use the activity mask to filter the primitives
         activity_mask_padded = None
@@ -496,15 +482,30 @@ def main():
                 # Update previous for next frame in GOP
                 previous_gaussians_full = {k: v.clone() for k, v in gaussians.items()}
             
+            # --- Backward Pass to fill gaps ---
+            if gop_size > 1:
+                for frame_idx in range(gop_size - 2, -1, -1):
+                    current_frame_data = gop_raw_frames[frame_idx]
+                    next_frame_data = gop_raw_frames[frame_idx + 1]
+                    
+                    # This mask is True for primitives that are inactive in the current frame
+                    # but WERE active in the next frame (and thus have a valid value to pull).
+                    inactive_in_current_mask = ~current_frame_data["activity_mask"]
+                    
+                    # Fill backward
+                    for key, tensor in current_frame_data["gaussians"].items():
+                        next_tensor = next_frame_data["gaussians"][key]
+                        tensor[inactive_in_current_mask] = next_tensor[inactive_in_current_mask]
+
             # b. Compute GOP-wide activity mask
             if not gop_raw_frames: continue
             gop_wide_activity_mask = torch.stack([f['activity_mask'] for f in gop_raw_frames]).any(dim=0)
-            
+
             num_active_primitives = gop_wide_activity_mask.sum().item()
             if num_active_primitives == 0:
                 processed_gops_data.append({'sidelen': 0, 'frames': []})
                 continue
-            
+
             # c. Calculate local square size and determine crop count
             n_sidelen_gop = int(math.sqrt(num_active_primitives))
             n_primitives_square = n_sidelen_gop * n_sidelen_gop
@@ -512,46 +513,96 @@ def main():
             if n_crop > 0:
                 print(f"GOP Info: Cropping {n_crop} primitives to form a {n_sidelen_gop}x{n_sidelen_gop} square.")
 
-            # d. Filter, crop, sort, and store processed frames
-            sort_indices = None
-            force_resort = True
+            # 1. Calculate the temporal average for all dynamic parameters over active frames
+            per_frame_activity = torch.stack([f['activity_mask'] for f in gop_raw_frames])
+            active_mask_per_frame = per_frame_activity[:, gop_wide_activity_mask]
+            num_active_frames = torch.sum(active_mask_per_frame, dim=0).clamp(min=1)
+
+            def get_average_param(param_name):
+                # Stack the parameter from all frames in the GOP
+                all_param = torch.stack([f['gaussians'][param_name] for f in gop_raw_frames])
+                # Filter to only primitives that are active at least once in the GOP
+                active_param_all_frames = all_param[:, gop_wide_activity_mask]
+                
+                # Create a mask for broadcasting based on param dimensions
+                mask = active_mask_per_frame
+                while mask.ndim < active_param_all_frames.ndim:
+                    mask = mask.unsqueeze(-1)
+
+                # Zero out values in frames where the primitive is inactive
+                masked_active_param = active_param_all_frames * mask
+                sum_of_param = torch.sum(masked_active_param, dim=0)
+                
+                # Denominator for averaging
+                avg_denom = num_active_frames
+                while avg_denom.ndim < sum_of_param.ndim:
+                    avg_denom = avg_denom.unsqueeze(-1)
+                    
+                average_param = sum_of_param / avg_denom
+                
+                if param_name == 'quats':
+                    # Re-normalize averaged quaternions
+                    average_param = F.normalize(average_param, dim=-1)
+                    
+                return average_param
+
+            gop_average_gaussians = {
+                "means": get_average_param("means"),
+            }
+
+            # 2. Determine primitives to keep after cropping, based on temporal stability (total active frames)
+            if n_crop > 0:
+                keep_indices_mask = torch.topk(num_active_frames, n_primitives_square, largest=True).indices
+            else:
+                keep_indices_mask = torch.arange(num_active_primitives, device=device)
+
+            # 3. Crop the average parameters, which will be used for the spatiotemporal sort
+            cropped_average_gaussians = {name: tensor[keep_indices_mask] for name, tensor in gop_average_gaussians.items()}
+
+            # 4. Perform a single spatiotemporal sort on all averaged parameters
+            print("GOP Info: Performing a single spatiotemporal sort on all averaged parameters...")
+            _, _, gop_wide_sort_indices, _ = dynamic_compressor.compress(
+                cropped_average_gaussians,
+                sort_indices=None,
+                force_resort=True
+            )
+            if gop_wide_sort_indices is None:
+                gop_wide_sort_indices = torch.arange(n_primitives_square, device=device)
+
+            # 5. Process each frame using this new architecture
             gop_processed_frames = []
-            keep_indices_mask = None # This will be computed once from the first frame and reused
-
-            for frame_idx, frame_data in enumerate(gop_raw_frames):
-                # Filter based on GOP-wide mask first
+            for frame_data in gop_raw_frames:
+                # Filter and crop all parameters for the current frame
                 filtered_gaussians = {name: tensor[gop_wide_activity_mask] for name, tensor in frame_data["gaussians"].items()}
-                filtered_activity_mask = frame_data["activity_mask"][gop_wide_activity_mask]
+                cropped_gaussians = {name: tensor[keep_indices_mask] for name, tensor in filtered_gaussians.items()}
+                cropped_activity_mask = frame_data["activity_mask"][gop_wide_activity_mask][keep_indices_mask]
 
-                # On the first frame, determine which primitives to keep for the whole GOP
-                if frame_idx == 0 and n_crop > 0:
-                    opacities_for_crop = filtered_gaussians["opacities"]
-                    # Get indices of the top N primitives with highest opacity to keep
-                    keep_indices_mask = torch.topk(opacities_for_crop, n_primitives_square).indices
+                # --- Assemble the final splat dictionary for the compressor ---
+                splats_to_compress = cropped_gaussians.copy()
                 
-                # Apply the consistent crop mask to all frames in the GOP
-                if keep_indices_mask is not None:
-                    cropped_gaussians = {name: tensor[keep_indices_mask] for name, tensor in filtered_gaussians.items()}
-                    cropped_activity_mask = filtered_activity_mask[keep_indices_mask]
-                else:
-                    cropped_gaussians = filtered_gaussians
-                    cropped_activity_mask = filtered_activity_mask
+                # Replace means with the static average and add the delta
+                splats_to_compress["means"] = cropped_average_gaussians["means"]
+                splats_to_compress["means_delta"] = cropped_gaussians["means"] - cropped_average_gaussians["means"]
+                
+                # For other params, we currently send the full values, not deltas.
+                # The static averaged values were only used for the unified sort.
 
-                # The data sent to the compressor is now perfectly square, so its internal cropping is skipped.
-                frame_meta, frame_arrays, new_indices, _ = dynamic_compressor.compress(
-                    cropped_gaussians, sort_indices=sort_indices, force_resort=force_resort
+                # Compress the combined data packet
+                frame_meta, frame_arrays, _, _ = dynamic_compressor.compress(
+                    splats_to_compress,
+                    sort_indices=gop_wide_sort_indices,
+                    force_resort=False # CRITICAL: Re-use the same layout for all frames
                 )
-                if new_indices is not None: sort_indices = new_indices
-                force_resort = False
-                
-                # Process the activity mask, which was already cropped, using the same sorting
-                sorted_activity_mask = cropped_activity_mask[sort_indices].cpu().numpy()
+
+                # Process the activity mask
+                sorted_activity_mask = cropped_activity_mask[gop_wide_sort_indices].cpu().numpy()
                 activity_grid = sorted_activity_mask.reshape(n_sidelen_gop, n_sidelen_gop)
                 frame_arrays["activity_mask"] = (activity_grid * 255).astype(np.uint8)
 
                 gop_processed_frames.append({'arrays': frame_arrays, 'meta': frame_meta})
-            
+
             processed_gops_data.append({'sidelen': n_sidelen_gop, 'frames': gop_processed_frames})
+      
 
         # --- Pass 2: Unify frame size and Encode Video ---
         print("\n--- Pass 2: Unifying frame sizes and preparing video buffers ---")

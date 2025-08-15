@@ -52,6 +52,8 @@ class Compression:
     seed: int = None
 
     def _get_compress_fn(self, param_name: str) -> Callable:
+        if param_name == "means_delta":
+            return _compress_webp_8bit_delta
         compress_fn_map = {
             "means": _compress_webp_16bit,
             "scales": _compress_webp,
@@ -66,6 +68,8 @@ class Compression:
             return _compress_npz
 
     def _get_decompress_fn(self, param_name: str) -> Callable:
+        if param_name == "means_delta":
+            return _decompress_webp_8bit_delta
         decompress_fn_map = {
             "means": _decompress_webp_16bit,
             "scales": _decompress_webp,
@@ -82,15 +86,19 @@ class Compression:
     def compress(
         self,
         splats: Dict[str, Tensor],
+        prev_sorted_grid: Optional[Tensor] = None,
         quality_settings: Optional[Dict[str, Any]] = None,
         sort_indices: Optional[Tensor] = None,
         force_resort: bool = False,
         shn_initial_centroids: Optional[Tensor] = None,
+        improvement_break: float = 1e-4,
     ) -> Tuple[Dict[str, Any], Dict[str, np.ndarray], Optional[Tensor], Optional[Tensor]]:
         """Run compression
 
         Args:
             splats (Dict[str, Tensor]): Gaussian splats to compress
+            prev_sorted_grid (Tensor, optional): Previous sorted grid to use for temporally-aware sorting.
+                If None, standard PLAS will be used. Defaults to None.
             quality_settings (Dict[str, Any], optional): Per-parameter quality settings.
                 E.g. {"means": {"lossless": False, "quality": 80}}. Defaults to class defaults.
             sort_indices (Tensor, optional): Pre-computed sorting indices to apply. If None,
@@ -115,6 +123,8 @@ class Compression:
             splats["means"] = log_transform(splats["means"])
         if "quats" in splats and splats["quats"] is not None:
             splats["quats"] = F.normalize(splats["quats"], dim=-1)
+        if "means_delta" in splats and splats["means_delta"] is not None:
+            splats["means_delta"] = log_transform(splats["means_delta"])
 
         # Reshape spherical harmonics from (N, D, 3) to (N, D*3) for compression
         if "sh0" in splats and splats["sh0"] is not None and splats["sh0"].ndim == 3:
@@ -145,7 +155,7 @@ class Compression:
             else:
                 # Compute new indices, possibly from a warm start
                 splats, newly_computed_indices = sort_splats(
-                    splats, seed=self.seed, initial_indices=sort_indices
+                    splats, prev_sorted_grid=prev_sorted_grid, seed=self.seed, initial_indices=sort_indices, improvement_break=improvement_break
                 )
 
         meta = {}
@@ -223,6 +233,8 @@ class Compression:
                 if "means" in splats and splats["means"] is not None
                 else 0
             )
+            if "means_delta" in splats and splats["means_delta"] is not None:
+                splats["means_delta"] = inverse_log_transform(splats["means_delta"])
             
             device = splats["means"].device if "means" in splats and splats["means"] is not None else device
 
@@ -708,3 +720,64 @@ def _decompress_kmeans(
     processing_time = time.time() - t0_proc
     timings = {"io_time": io_time, "processing_time": processing_time}
     return params, timings
+
+
+def _compress_webp_8bit_delta(
+    param_name: str, params: Tensor, n_sidelen: int, **kwargs
+) -> Tuple[Dict, Dict]:
+    """Compresses delta values using 8-bit symmetric quantization."""
+    if torch.numel(params) == 0:
+        meta = {"shape": list(params.shape), "dtype": str(params.dtype).split(".")[1]}
+        return meta, {}
+
+    # Calculate per-channel delta_max. From (N, C) -> (C,)
+    delta_max = torch.amax(torch.abs(params), dim=0)
+
+    grid = params.reshape((n_sidelen, n_sidelen, -1))
+
+    denominator = 2 * delta_max
+    # Symmetrically quantize to [0, 1]. Map [-delta_max, +delta_max] to [0, 1].
+    # Zero is mapped to 0.5. Handle channels with no delta (denominator is zero).
+    grid_norm = torch.where(
+        denominator > 1e-6,
+        (grid + delta_max) / denominator,
+        torch.full_like(grid, 0.5),
+    )
+
+    img_uint8 = (grid_norm.clamp(0, 1) * 255).round().cpu().numpy().astype(np.uint8)
+
+    meta = {
+        "shape": list(params.shape),
+        "dtype": str(params.dtype).split(".")[1],
+        "delta_max": delta_max.tolist(),
+    }
+    return meta, {"img": img_uint8.squeeze()}
+
+
+def _decompress_webp_8bit_delta(
+    param_name: str,
+    meta: Dict[str, Any],
+    image_data: Dict[str, np.ndarray],
+    device: str = "cpu",
+    to_tensors: bool = True,
+) -> Tuple[Any, Dict]:
+    """Decompresses delta values from 8-bit symmetric quantization."""
+    img = image_data[param_name]
+    delta_max_list = meta["delta_max"]
+
+    # Ensure image is at least 3D for consistent processing if channels were squeezed
+    if img.ndim == 2:
+        img = np.expand_dims(img, axis=-1)
+
+    if to_tensors:
+        grid_norm = torch.tensor(img / 255.0, device=device, dtype=torch.float32)
+        delta_max = torch.tensor(delta_max_list, device=device, dtype=torch.float32)
+        grid = grid_norm * (2 * delta_max) - delta_max
+        params = grid.reshape(meta["shape"]).to(dtype=getattr(torch, meta["dtype"]))
+    else:
+        grid_norm = img / 255.0
+        delta_max = np.array(delta_max_list, dtype=np.float32)
+        grid = grid_norm * (2 * delta_max) - delta_max
+        params = grid.reshape(meta["shape"]).astype(meta["dtype"])
+
+    return params, {}
