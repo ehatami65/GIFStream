@@ -793,6 +793,7 @@ class Runner:
         regular: bool = False,
         step: int = -1,
         camera_ids: Tensor = None,
+        override_anchor_mask: Optional[Tensor] = None,
     ) -> Dict:
         """
         Compute the neural Gaussian parameters for the current view and time.
@@ -809,22 +810,26 @@ class Runner:
             regular (bool, optional): Whether to compute regularization loss. Defaults to False.
             step (int, optional): Current training step. Defaults to -1.
             camera_ids (Tensor, optional): Camera IDs for appearance embedding. Defaults to None.
+            override_anchor_mask (Optional[Tensor], optional): If provided, this mask is used instead of calculating visibility. Defaults to None.
 
         Returns:
             Dict: A dictionary containing the parameters of visible neural Gaussians, including means, colors, opacities, scales, rotations, and auxiliary losses.
         """
         # Compute which anchors (Gaussians) are visible in the current view
-        visible_anchor_mask = view_to_visible_anchors(
-            means=self.splats["anchors"],
-            quats=self.splats["quats"],
-            scales=torch.exp(self.splats["scales"][:, :3]),
-            viewmats=torch.linalg.inv(camtoworlds), 
-            Ks=Ks,
-            width=width,
-            height=height,
-            packed=packed,
-            rasterize_mode=rasterize_mode,
-        )
+        if override_anchor_mask is not None:
+            visible_anchor_mask = override_anchor_mask
+        else:
+            visible_anchor_mask = view_to_visible_anchors(
+                means=self.splats["anchors"],
+                quats=self.splats["quats"],
+                scales=torch.exp(self.splats["scales"][:, :3]),
+                viewmats=torch.linalg.inv(camtoworlds), 
+                Ks=Ks,
+                width=width,
+                height=height,
+                packed=packed,
+                rasterize_mode=rasterize_mode,
+            )
 
         # Select anchors and offsets for visible Gaussians
         if not self.cfg.compression_sim:
@@ -1405,61 +1410,45 @@ class Runner:
 
         for frame_idx in tqdm.trange(cfg.GOP_size, desc="Exporting PLY sequence"):
             time = frame_idx / (cfg.GOP_size - 1)
-            
-            # Use an all-ones mask to consider all anchors
-            visible_anchor_mask = torch.ones(self.splats["anchors"].shape[0], dtype=torch.bool, device=self.device)
+
+            # Use an all-ones mask to consider all anchors for export
+            all_anchor_mask = torch.ones(
+                self.splats["anchors"].shape[0], dtype=torch.bool, device=self.device
+            )
+
+            # Dummy camera parameters since we are overriding the visibility mask
             camtoworlds = torch.eye(4, device=self.device).unsqueeze(0)
-            camera_ids = torch.tensor([0], device=self.device) if cfg.app_opt else None
-
-            # The following logic is a direct copy of get_neural_gaussians
-            selected_anchors = self.splats["anchors"][visible_anchor_mask]
-            selected_offsets = self.splats["offsets"][visible_anchor_mask]
-
-            results = self.decoding_features(
-                camtoworlds, time, visible_anchor_mask, canonical=False, step=-1, camera_ids=camera_ids
+            camera_ids = (
+                torch.tensor([0], device=self.device) if cfg.app_opt else None
             )
 
-            neural_opacity = results["neural_opacity"]
-            neural_colors = results["neural_colors"]
-            neural_scale_rot = results["neural_scale_rot"]
-            motion = results["motion"]
-            selected_scales = results["selected_scales"]
-
-            neural_selection_mask = (neural_opacity < 0.0).view(-1)
-            neural_opacity[neural_selection_mask] = -1e10
-            
-            anchor_offset = motion[:, -7:-4]
-            # Use a new variable to avoid in-place modification ambiguity
-            moved_anchors = selected_anchors + anchor_offset
-
-            anchor_rot = torch.nn.functional.normalize(
-                0.1 * motion[:, -4:] + torch.tensor([[1, 0, 0, 0]], device=self.device)
-            )
-            anchor_rotation = quaternion_to_rotation_matrix(anchor_rot)
-            
-            transformed_offsets = torch.bmm(
-                selected_offsets.view(-1, self.cfg.n_offsets, 3) * selected_scales.unsqueeze(1)[:, :, :3],
-                anchor_rotation.reshape((-1, 3, 3)).transpose(1, 2),
-            ).reshape((-1, 3))
-
-            scales_repeated = (
-                selected_scales.unsqueeze(1).repeat(1, self.cfg.n_offsets, 1).view(-1, 6)
-            )
-            anchors_repeated = (
-                moved_anchors.unsqueeze(1).repeat(1, self.cfg.n_offsets, 1).view(-1, 3)
+            # Get all neural gaussians for the current time step
+            neural_gaussians = self.get_neural_gaussians(
+                camtoworlds=camtoworlds,
+                Ks=torch.eye(3, device=device).unsqueeze(
+                    0
+                ),  # Dummy K, not used when overriding mask
+                width=1,  # Dummy width, not used when overriding mask
+                height=1,  # Dummy height, not used when overriding mask
+                packed=self.cfg.packed,
+                rasterize_mode="classic",
+                time=time,
+                canonical=False,
+                regular=False,
+                step=-1,
+                camera_ids=camera_ids,
+                override_anchor_mask=all_anchor_mask,
             )
 
-            # Filter all properties based on the opacity mask
-            opacities = neural_opacity.squeeze(-1)
-            colors = neural_colors
-            scale_rot = neural_scale_rot
-            offsets = transformed_offsets
-            scales_rep = scales_repeated
-            anchors_rep = anchors_repeated
+            # Extract final parameters
+            means = neural_gaussians["means"]
+            scales = neural_gaussians["scales"]
+            rotation = neural_gaussians["quats"]
+            opacities = neural_gaussians["opacities"]
+            colors = neural_gaussians["colors"]
 
-            scales = scales_rep[:, 3:] * torch.sigmoid(scale_rot[:, :3])
-            rotation = torch.nn.functional.normalize(scale_rot[:, 3:7])
-            means = anchors_rep + offsets
+            # Convert opacities to logits for saving
+            opacities = torch.logit(opacities.clamp(1e-6, 1.0 - 1e-6))
 
             filepath = os.path.join(export_dir, f"{frame_idx:04d}.ply")
             sh0 = rgb2sh(colors).unsqueeze(1)
@@ -1474,8 +1463,6 @@ class Runner:
                 shN=shN,
                 save_to=filepath,
             )
-            # splats_dict = {"means": means, "scales": torch.log(scales.clamp(min=1e-6)), "quats": rotation, "opacities": opacities, "sh0": sh0, "shN": shN}
-            # save_ply(splats_dict, filepath)
         print(f"Exported PLY sequence to {export_dir}")
         self.istraining = training_state
 
@@ -1733,7 +1720,6 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
             
             if cfg.export_ply:
                 runner.export_ply_sequence(step=step)
-                return
 
             runner.eval(step=step)
             runner.render_traj(step=step)
