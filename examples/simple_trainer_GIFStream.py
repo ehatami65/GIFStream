@@ -17,7 +17,7 @@ import tqdm
 import tyro
 import viser
 import yaml
-from datasets.GIFStream_new import Dataset, Parser
+from datasets.GIFStream_new_copy import Dataset, Parser
 from datasets.traj import (
     generate_interpolated_path,
     generate_ellipse_path_z,
@@ -80,9 +80,9 @@ class Config:
     # Path to the .pt files. If provide, it will skip training and run evaluation only.
     ckpt: Optional[List[str]] = None
     # Export the scene as a sequence of .ply files
-    export_ply: bool = False
+    export_ply: bool = True
     # render trajectory 
-    render_traj: bool = False
+    render_traj: bool = True
     # Name of compression strategy to use
     compression: Optional[Literal["end2end", "2dcodec"]] = None
     # Quantization parameters when set to hevc
@@ -142,7 +142,7 @@ class Config:
     steps_scaler: float = 1.0
 
     # Number of training steps
-    max_steps: int = 30_000
+    max_steps: int = 80_000
     # Steps to evaluate the model
     eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
     # Steps to save the model
@@ -1808,7 +1808,7 @@ if __name__ == "__main__":
                 test_set=[0],
                 normalize_world_space=False,
                 anchor_feature_dim=48,
-                c_perframe = 4,
+                c_perframe = 8,
                 app_opt=False,
             ),
         ),
@@ -1833,7 +1833,7 @@ if __name__ == "__main__":
             "neur3d dataset",
             Config(
                 strategy=GIFStreamStrategy(verbose=True,densify_grad_threshold=0.0006,deformation_gate=0.03),
-                test_set=[],
+                test_set=[0],
                 remove_set=[],
                 normalize_world_space=False,
                 anchor_feature_dim=48,

@@ -88,43 +88,41 @@ class Parser:
             cam = cameras[image.camera_id]
             fx, fy, cx, cy = 0, 0, 0, 0
             if cam.model == "SIMPLE_PINHOLE":
-                fx, cx, cy = cam.params
-                fy = fx
+                fx = fy = cam.params[0]
+                cx, cy = cam.params[1], cam.params[2]
+                params = np.empty(0, dtype=np.float32)
+                camtype = "perspective"
             elif cam.model == "PINHOLE":
                 fx, fy, cx, cy = cam.params
+                params = np.empty(0, dtype=np.float32)
+                camtype = "perspective"
+            elif cam.model == "SIMPLE_RADIAL":
+                fx, cx, cy, k = cam.params
+                fy = fx
+                params = np.array([k, 0.0, 0.0, 0.0], dtype=np.float32)
+                camtype = "perspective"
+            elif cam.model == "RADIAL":
+                fx, cx, cy, k1, k2 = cam.params
+                fy = fx
+                params = np.array([k1, k2, 0.0, 0.0], dtype=np.float32)
+                camtype = "perspective"
+            elif cam.model == "OPENCV":
+                fx, fy, cx, cy, k1, k2, p1, p2 = cam.params
+                params = np.array([k1, k2, p1, p2], dtype=np.float32)
+                camtype = "perspective"
+            elif cam.model == "OPENCV_FISHEYE":
+                fx, fy, cx, cy, k1, k2, k3, k4 = cam.params
+                params = np.array([k1, k2, k3, k4], dtype=np.float32)
+                camtype = "fisheye"
             else:
-                raise ValueError(f"Unsupported camera model: {cam.model}")
+                raise NotImplementedError(f"Camera model {cam.model} not implemented.")
             
             K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
             K[:2, :] /= factor
             Ks_dict_by_cam[cam_name] = K
             imsize_dict_by_cam[cam_name] = (cam.width // factor, cam.height // factor)
 
-            # Extract distortion parameters
-            if cam.model == "SIMPLE_RADIAL":
-                k1, _, _ = cam.params
-                params = np.array([k1, 0.0, 0.0, 0.0], dtype=np.float32)
-                camtype = "perspective"
-            elif cam.model == "RADIAL":
-                k1, k2, _, _ = cam.params
-                params = np.array([k1, k2, 0.0, 0.0], dtype=np.float32)
-                camtype = "perspective"
-            elif cam.model == "OPENCV":
-                k1, k2, p1, p2, _, _, _, _ = cam.params
-                params = np.array([k1, k2, p1, p2], dtype=np.float32)
-                camtype = "perspective"
-            elif cam.model == "OPENCV_FISHEYE":
-                k1, k2, k3, k4, _, _, _, _ = cam.params
-                params = np.array([k1, k2, k3, k4], dtype=np.float32)
-                camtype = "fisheye"
-            else: # PINHOLE and SIMPLE_PINHOLE
-                params = np.empty(0, dtype=np.float32)
-                camtype = "perspective"
-
-            assert (
-                camtype == "perspective" or camtype == "fisheye"
-            ), f"Only perspective and fisheye cameras are supported, got {cam.model}"
-            
+            #
             last_cam_type = cam.model
             params_dict_by_cam[cam_name] = params
             mask_dict_by_cam[cam_name] = None
@@ -149,9 +147,34 @@ class Parser:
                 cam = cameras[cam_id]
                 # Re-extract intrinsics for the unique camera ids
                 if cam.model == "SIMPLE_PINHOLE":
-                    fx, cx, cy = cam.params; fy = fx
-                else: # PINHOLE
+                    fx = fy = cam.params[0]
+                    cx, cy = cam.params[1], cam.params[2]
+                    params = np.empty(0, dtype=np.float32)
+                    camtype = "perspective"
+                elif cam.model == "PINHOLE":
                     fx, fy, cx, cy = cam.params
+                    params = np.empty(0, dtype=np.float32)
+                    camtype = "perspective"
+                elif cam.model == "SIMPLE_RADIAL":
+                    fx, cx, cy, k = cam.params
+                    fy = fx
+                    params = np.array([k, 0.0, 0.0, 0.0], dtype=np.float32)
+                    camtype = "perspective"
+                elif cam.model == "RADIAL":
+                    fx, cx, cy, k1, k2 = cam.params
+                    fy = fx
+                    params = np.array([k1, k2, 0.0, 0.0], dtype=np.float32)
+                    camtype = "perspective"
+                elif cam.model == "OPENCV":
+                    fx, fy, cx, cy, k1, k2, p1, p2 = cam.params
+                    params = np.array([k1, k2, p1, p2], dtype=np.float32)
+                    camtype = "perspective"
+                elif cam.model == "OPENCV_FISHEYE":
+                    fx, fy, cx, cy, k1, k2, k3, k4 = cam.params
+                    params = np.array([k1, k2, k3, k4], dtype=np.float32)
+                    camtype = "fisheye"
+                else:
+                    raise NotImplementedError(f"Camera model {cam.model} not implemented.")
                 
                 K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
                 K[:2, :] /= factor
@@ -159,16 +182,7 @@ class Parser:
                 imsize_dict[cam_id] = (cam.width // factor, cam.height // factor)
 
                 # Re-extract distortion
-                if cam.model == "SIMPLE_RADIAL":
-                    params = np.array([cam.params[0], 0.0, 0.0, 0.0], dtype=np.float32)
-                elif cam.model == "RADIAL":
-                    params = np.array([cam.params[0], cam.params[1], 0.0, 0.0], dtype=np.float32)
-                elif cam.model == "OPENCV":
-                    params = np.array([cam.params[0], cam.params[1], cam.params[2], cam.params[3]], dtype=np.float32)
-                elif cam.model == "OPENCV_FISHEYE":
-                    params = np.array([cam.params[0], cam.params[1], cam.params[2], cam.params[3]], dtype=np.float32)
-                else:
-                    params = np.empty(0, dtype=np.float32)
+                
                 params_dict[cam_id] = params
                 mask_dict[cam_id] = None
 
@@ -362,7 +376,7 @@ class Dataset:
         indices = np.arange(len(self.parser.camera_names)*GOP_size)
         self.cameras_length = len(self.parser.camera_names)
         if split == "train":
-            self.indices = [x for x in indices if (x // GOP_size) not in test_set]
+            self.indices = [x for x in indices if (x // GOP_size) ]#not in test_set]
         else:
             self.indices = [x for x in indices if (x // GOP_size) in test_set]
 
@@ -394,6 +408,7 @@ class Dataset:
             image = cv2.remap(image, mapx, mapy, cv2.INTER_LINEAR)
             x, y, w, h = self.parser.roi_undist_dict[camera_id]
             image = image[y : y + h, x : x + w]
+       
 
         if self.patch_size is not None:
             # Random crop.
