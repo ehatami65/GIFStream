@@ -71,6 +71,12 @@ We provide a script that enables end-to-end compression-aware training and compr
 ```bash
 bash examples/benchmarks/multigop_gifstream.sh
 ```
+
+**Note:** The `--export_ply` flag enables exporting the PLY file. For example:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python examples/simple_trainer_GIFStream.py neur3d_1 --disable_viewer --data_factor 2  --render_traj_path ellipse --data_dir /path/to/data_dir/ --result_dir /path/to/result  --eval_steps 3000 7000 30000 --save_steps 7000 30000 --batch_size 1 --GOP_size 50 --knn --start_frame  0 --export_ply
+```
 ## ✅ TODO
 - [x] Release code using [gsplat](https://github.com/nerfstudio-project/gsplat/tree/main) and [gscodec studio](https://github.com/JasonLSC/GSCodec_Studio) framework.
 
