@@ -17,7 +17,7 @@ import tqdm
 import tyro
 import viser
 import yaml
-from datasets.GIFStream_new_copy import Dataset, Parser
+from datasets.GIFStream_original import Dataset, Parser
 from datasets.traj import (
     generate_interpolated_path,
     generate_ellipse_path_z,
@@ -176,7 +176,7 @@ class Config:
     antialiased: bool = False
 
     # Use random background for training to discourage transparency
-    random_bkgd: bool = False
+    random_bkgd: bool = True
 
     # Scale regularization
     scale_reg: float = 0.01

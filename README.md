@@ -75,7 +75,33 @@ bash examples/benchmarks/multigop_gifstream.sh
 **Note:** The `--export_ply` flag enables exporting the PLY file. For example:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python examples/simple_trainer_GIFStream.py neur3d_1 --disable_viewer --data_factor 2  --render_traj_path ellipse --data_dir /path/to/data_dir/ --result_dir /path/to/result  --eval_steps 3000 7000 30000 --save_steps 7000 30000 --batch_size 1 --GOP_size 50 --knn --start_frame  0 --export_ply
+CUDA_VISIBLE_DEVICES=0 python examples/simple_trainer_GIFStream.py neur3d_1 --disable_viewer --data_factor 2  --render_traj_path ellipse --data_dir /data/shared/elaheh/4D/4D_scenes/tri_cleaners/ --result_dir /data/shared/elaheh/4D/4D_scenes/tri_cleaners/gifstream_undistort_merge50_colmap_1/  --eval_steps 3000 7000 30000 40000 50000 60000 70000 80000  --save_steps 7000 30000  40000 50000 60000 70000 80000  --batch_size 1 --GOP_size 50 --knn --start_frame  1 --export_ply
+```
+
+**Data Preparation:**
+To run the GIFStream training, you need to prepare your data in a specific structure. The `--data_dir` argument should point to a directory with the following structure:
+*   A directory named `colmap_{start_frame}/sparse/0` or `sparse/0` (where `{start_frame}` is the value of the `--start_frame` argument). This directory should contain the COLMAP reconstruction data (cameras.bin, images.bin, points3D.bin).
+*   A directory named `images` (or `png`, depending on your dataset) containing subdirectories, where each subdirectory is named after a camera (e.g., `002-004`). Inside each camera subdirectory, you should have the image frames.
+The image frames within the camera subdirectories should follow a consistent naming convention (e.g., `{(frame_idx+1):05d}.png`, `{(frame_idx+1):06d}.jpg`). This naming convention is hardcoded in the data loader (`examples/datasets/GIFStream_new_copy.py` or `examples/datasets/GIFStream_original.py`) and can be modified if needed.
+You need to run COLMAP on the initial frame data to obtain the camera poses and generate the .bin files. The `start_frame` parameter should correspond to the frame used for the COLMAP reconstruction.
+The dataloader (`examples/datasets/GIFStream_new_copy.py` or `examples/datasets/GIFStream_original.py`) contains hardcoded names for the image directory (`images` or `png`) and the frame naming convention. You can modify these hardcoded names to match your custom data structure.
+Here's an example of the data directory tree structure:
+```
+data_dir/
+├── colmap_{start_frame}/sparse/0/  (or sparse/0/)
+│   ├── cameras.bin
+│   ├── images.bin
+│   └── points3D.bin
+└── images/ (or png/)
+    ├── camera_001/
+    │   ├── 000001.jpg (or 000001.png)
+    │   ├── 000002.jpg
+    │   └── ...
+    ├── camera_002/
+    │   ├── 000001.jpg
+    │   ├── 000002.jpg
+    │   └── ...
+    └── ...
 ```
 ## ✅ TODO
 - [x] Release code using [gsplat](https://github.com/nerfstudio-project/gsplat/tree/main) and [gscodec studio](https://github.com/JasonLSC/GSCodec_Studio) framework.
